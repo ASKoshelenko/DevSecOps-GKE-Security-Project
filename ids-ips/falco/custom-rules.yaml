@@ -1,0 +1,626 @@
+# =============================================================================
+# Falco Custom Rules - Russian APT Detection
+# =============================================================================
+#
+# These rules are specifically designed to detect tactics, techniques, and
+# procedures (TTPs) associated with Russian APT groups targeting GKE/GCP
+# environments. Each rule maps to specific MITRE ATT&CK techniques.
+#
+# Threat Model:
+#   - "Magic" file creation in /tmp (T1105 - Ingress Tool Transfer)
+#   - C2 backconnect on ports 4444/5555/8443 (T1071 - Application Layer Protocol)
+#   - Stolen service account key abuse (T1078 - Valid Accounts)
+#   - Crypto mining deployment (T1496 - Resource Hijacking)
+#   - Container escape attempts (T1611 - Escape to Host)
+#   - Reverse shell execution (T1059 - Command and Scripting Interpreter)
+#
+# Priority levels used:
+#   EMERGENCY - Active exploitation detected, immediate response needed
+#   CRITICAL  - High-confidence APT indicator, likely active compromise
+#   WARNING   - Suspicious activity that requires investigation
+#   NOTICE    - Informational, may indicate reconnaissance
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Required Macros
+# -----------------------------------------------------------------------------
+
+- macro: container
+  condition: (container.id != host)
+
+- macro: spawned_process
+  condition: (evt.type in (execve, execveat) and evt.dir = <)
+
+- macro: open_write
+  condition: >
+    evt.type in (open, openat, openat2) and
+    evt.is_open_write = true and
+    fd.typechar = 'f'
+
+- macro: open_read
+  condition: >
+    evt.type in (open, openat, openat2) and
+    evt.is_open_read = true and
+    fd.typechar = 'f'
+
+# Known safe system processes that may write to /tmp
+- macro: safe_tmp_writers
+  condition: >
+    (proc.name in (systemd-private, apt, dpkg, yum, rpm, pip, pip3, npm,
+                   containerd, dockerd, kubelet, kube-proxy))
+
+# Known legitimate crypto-related process names (to reduce false positives)
+- macro: known_crypto_miners
+  condition: >
+    (proc.name in (xmrig, xmr-stak, minerd, minergate, cpuminer,
+                   ethminer, cgminer, bfgminer, nbminer, t-rex,
+                   phoenixminer, lolminer, gminer, ccminer,
+                   stratum, cryptonight, monero, kswapd0))
+
+# C2 ports commonly used by APT groups and red team tools
+- macro: c2_ports
+  condition: >
+    (fd.sport in (4444, 5555, 8443, 9001, 1337, 6666, 6667, 31337,
+                  12345, 65535, 2222, 3333, 7777, 9999))
+
+# Container escape tools
+- macro: escape_tools
+  condition: >
+    (proc.name in (nsenter, chroot, unshare, pivot_root) or
+     (proc.name = mount and not proc.pname in (kubelet, dockerd, containerd)))
+
+# Known legitimate pods that access service account tokens
+- macro: known_sa_consumers
+  condition: >
+    (k8s.pod.name startswith "kube-system" or
+     k8s.pod.name startswith "istio" or
+     k8s.pod.name startswith "falco" or
+     k8s.pod.name startswith "calico" or
+     k8s.pod.name startswith "gke-")
+
+# =============================================================================
+# RULE 1: Magic File in /tmp - Primary APT IOC
+# =============================================================================
+# The Russian APT is known to create a "magic" file in /tmp as an indicator
+# of successful initial access. This is a marker file used by the malware
+# to signal that the dropper has executed successfully.
+#
+# MITRE ATT&CK: T1105 (Ingress Tool Transfer), T1059.004 (Unix Shell)
+# =============================================================================
+
+- rule: APT Magic File Created in /tmp
+  desc: >
+    Detects creation of files matching the "magic" pattern in /tmp directory.
+    Russian APT groups are known to drop a marker file named "magic" or
+    containing "magic" in /tmp after successful initial access. This is a
+    high-fidelity indicator of compromise specific to this threat actor.
+  condition: >
+    open_write and
+    container and
+    (fd.name startswith /tmp/magic or
+     fd.name startswith /tmp/.magic or
+     fd.name = /tmp/magic or
+     fd.name regex "/tmp/.*magic.*") and
+    not safe_tmp_writers
+  output: >
+    CRITICAL APT INDICATOR - Magic file created in /tmp
+    (file=%fd.name
+     user=%user.name uid=%user.uid
+     process=%proc.name pid=%proc.pid
+     command=%proc.cmdline
+     parent=%proc.pname
+     container_id=%container.id
+     container_name=%container.name
+     image=%container.image.repository:%container.image.tag
+     k8s_pod=%k8s.pod.name
+     k8s_ns=%k8s.ns.name
+     k8s_deployment=%k8s.deployment.name)
+  priority: CRITICAL
+  tags:
+    - apt
+    - russian_apt
+    - ioc
+    - mitre_t1105
+    - mitre_ingress_tool_transfer
+    - file_creation
+    - tmp_directory
+  source: syscall
+  enabled: true
+
+# =============================================================================
+# RULE 2: Outbound C2 Connection Detected
+# =============================================================================
+# APT groups use specific ports to establish reverse shells and C2 channels.
+# Port 4444 (Metasploit), 5555 (custom RAT), 8443 (Cobalt Strike), and
+# 9001 (TOR/custom) are commonly associated with Russian APT activity.
+#
+# MITRE ATT&CK: T1071.001 (Web Protocols), T1573 (Encrypted Channel)
+# =============================================================================
+
+- rule: Outbound Connection to C2 Port
+  desc: >
+    Detects outbound network connections from containers to ports commonly
+    used by C2 frameworks. Ports 4444 (Metasploit default), 5555 (common RAT),
+    8443 (Cobalt Strike default), and 9001 (TOR/custom C2) are high-priority
+    indicators. Other ports (1337, 6666/6667, 31337) are included for
+    broader coverage of backdoor communications.
+  condition: >
+    evt.type in (connect) and
+    evt.dir = < and
+    container and
+    fd.type = ipv4 and
+    fd.direction = out and
+    c2_ports
+  output: >
+    EMERGENCY C2 CALLBACK DETECTED - Outbound connection to known C2 port
+    (connection=%fd.name
+     dest_ip=%fd.sip
+     dest_port=%fd.sport
+     protocol=%fd.l4proto
+     user=%user.name uid=%user.uid
+     process=%proc.name pid=%proc.pid
+     command=%proc.cmdline
+     parent=%proc.pname
+     container_id=%container.id
+     container_name=%container.name
+     image=%container.image.repository:%container.image.tag
+     k8s_pod=%k8s.pod.name
+     k8s_ns=%k8s.ns.name)
+  priority: EMERGENCY
+  tags:
+    - apt
+    - russian_apt
+    - c2
+    - network
+    - mitre_t1071
+    - mitre_application_layer_protocol
+    - mitre_t1573
+    - mitre_encrypted_channel
+  source: syscall
+  enabled: true
+
+# =============================================================================
+# RULE 3: Crypto Mining Process Detected
+# =============================================================================
+# After gaining access, APT groups frequently deploy crypto miners as a
+# secondary monetization strategy. Detection of known mining process names
+# is a high-confidence indicator.
+#
+# MITRE ATT&CK: T1496 (Resource Hijacking)
+# =============================================================================
+
+- rule: Crypto Mining Process Detected
+  desc: >
+    Detects execution of known cryptocurrency mining processes inside
+    containers. Russian APT groups commonly deploy crypto miners (especially
+    Monero/XMR miners like xmrig) after gaining access to maximize profit.
+    This rule matches both common miner binaries and processes with
+    mining-related command line arguments.
+  condition: >
+    spawned_process and
+    container and
+    (known_crypto_miners or
+     proc.cmdline contains "stratum+tcp://" or
+     proc.cmdline contains "stratum+ssl://" or
+     proc.cmdline contains "mining.pool" or
+     proc.cmdline contains "--coin=" or
+     proc.cmdline contains "--algo=cryptonight" or
+     proc.cmdline contains "--algo=randomx" or
+     proc.cmdline contains "-o pool." or
+     proc.cmdline contains "xmrpool" or
+     proc.cmdline contains "nicehash" or
+     proc.cmdline contains "hashvault" or
+     proc.cmdline contains "minergate" or
+     proc.cmdline contains "nanopool" or
+     proc.cmdline contains "supportxmr")
+  output: >
+    CRITICAL CRYPTO MINER DETECTED - Mining process running in container
+    (process=%proc.name pid=%proc.pid
+     command=%proc.cmdline
+     parent=%proc.pname
+     user=%user.name uid=%user.uid
+     container_id=%container.id
+     container_name=%container.name
+     image=%container.image.repository:%container.image.tag
+     k8s_pod=%k8s.pod.name
+     k8s_ns=%k8s.ns.name
+     k8s_deployment=%k8s.deployment.name
+     cpu_usage=%thread.cpu)
+  priority: CRITICAL
+  tags:
+    - apt
+    - cryptomining
+    - resource_hijacking
+    - mitre_t1496
+    - mitre_resource_hijacking
+  source: syscall
+  enabled: true
+
+# =============================================================================
+# RULE 4: Container Escape Attempt
+# =============================================================================
+# APT groups attempt to escape container boundaries to access the host node.
+# Common techniques include nsenter, chroot, mounting host filesystems, and
+# exploiting kernel vulnerabilities.
+#
+# MITRE ATT&CK: T1611 (Escape to Host)
+# =============================================================================
+
+- rule: Container Escape Attempt Detected
+  desc: >
+    Detects attempts to escape container isolation using tools like nsenter,
+    chroot, unshare, or mounting host filesystems. These are critical
+    indicators of lateral movement from a compromised container to the
+    underlying GKE node. Successful escape gives the attacker access to
+    all pods on the node and potentially the kubelet credentials.
+  condition: >
+    spawned_process and
+    container and
+    (escape_tools or
+     (proc.name = mount and proc.cmdline contains "/proc") or
+     (proc.cmdline contains "nsenter" and proc.cmdline contains "-t 1") or
+     (proc.cmdline contains "/var/run/docker.sock") or
+     (proc.cmdline contains "/run/containerd/containerd.sock") or
+     proc.cmdline contains "/.dockerenv" or
+     (proc.name = capsh and proc.cmdline contains "--") or
+     (proc.cmdline contains "/proc/1/root") or
+     (proc.cmdline contains "/proc/sysrq-trigger"))
+  output: >
+    EMERGENCY CONTAINER ESCAPE ATTEMPT - Breakout from container detected
+    (process=%proc.name pid=%proc.pid
+     command=%proc.cmdline
+     parent=%proc.pname
+     user=%user.name uid=%user.uid
+     container_id=%container.id
+     container_name=%container.name
+     image=%container.image.repository:%container.image.tag
+     k8s_pod=%k8s.pod.name
+     k8s_ns=%k8s.ns.name
+     capabilities=%proc.cap.permitted)
+  priority: EMERGENCY
+  tags:
+    - apt
+    - container_escape
+    - privilege_escalation
+    - mitre_t1611
+    - mitre_escape_to_host
+    - mitre_t1548
+    - mitre_abuse_elevation_control
+  source: syscall
+  enabled: true
+
+# =============================================================================
+# RULE 5: Suspicious kubectl / API Server Access
+# =============================================================================
+# After initial access, APT groups perform reconnaissance using kubectl or
+# direct API server calls to map the cluster, find secrets, and identify
+# lateral movement targets.
+#
+# MITRE ATT&CK: T1613 (Container and Resource Discovery), T1087 (Account Discovery)
+# =============================================================================
+
+- rule: Suspicious kubectl or API Server Access
+  desc: >
+    Detects execution of kubectl or curl/wget against the Kubernetes API
+    server from within a container. Legitimate workloads should use
+    Kubernetes client libraries, not CLI tools. kubectl execution inside
+    a pod is a strong indicator of post-exploitation reconnaissance.
+  condition: >
+    spawned_process and
+    container and
+    (proc.name = kubectl or
+     (proc.name in (curl, wget) and
+      (proc.cmdline contains "kubernetes.default" or
+       proc.cmdline contains "kubernetes.default.svc" or
+       proc.cmdline contains ":6443" or
+       proc.cmdline contains ":8443/api" or
+       proc.cmdline contains ":443/api" or
+       proc.cmdline contains "/api/v1/" or
+       proc.cmdline contains "/apis/")) or
+     proc.cmdline contains "kubectl get secrets" or
+     proc.cmdline contains "kubectl get configmap" or
+     proc.cmdline contains "kubectl get nodes" or
+     proc.cmdline contains "kubectl auth can-i" or
+     proc.cmdline contains "kubectl cluster-info")
+  output: >
+    WARNING SUSPICIOUS K8S API ACCESS - kubectl or API server access from container
+    (process=%proc.name pid=%proc.pid
+     command=%proc.cmdline
+     parent=%proc.pname
+     user=%user.name uid=%user.uid
+     container_id=%container.id
+     container_name=%container.name
+     image=%container.image.repository:%container.image.tag
+     k8s_pod=%k8s.pod.name
+     k8s_ns=%k8s.ns.name
+     k8s_sa=%k8s.pod.service_account)
+  priority: WARNING
+  tags:
+    - apt
+    - reconnaissance
+    - discovery
+    - mitre_t1613
+    - mitre_container_resource_discovery
+    - mitre_t1087
+    - mitre_account_discovery
+    - kubernetes_api
+  source: syscall
+  enabled: true
+
+# =============================================================================
+# RULE 6: Service Account Token Access from Unusual Pod
+# =============================================================================
+# APT groups target Kubernetes service account tokens to authenticate to the
+# API server and perform lateral movement. Reading the projected SA token
+# from an unexpected pod is suspicious.
+#
+# MITRE ATT&CK: T1528 (Steal Application Access Token)
+# =============================================================================
+
+- rule: Service Account Token Accessed from Unusual Pod
+  desc: >
+    Detects processes reading Kubernetes service account tokens from the
+    projected volume mount. While some system components legitimately read
+    these tokens, most application pods should not directly access the raw
+    token file. This can indicate an attacker harvesting tokens for
+    lateral movement or privilege escalation within the cluster.
+  condition: >
+    open_read and
+    container and
+    (fd.name startswith /var/run/secrets/kubernetes.io/serviceaccount/token or
+     fd.name startswith /run/secrets/kubernetes.io/serviceaccount/token or
+     fd.name contains "serviceaccount/token") and
+    not known_sa_consumers and
+    not proc.name in (kubelet, kube-proxy, coredns, kube-dns)
+  output: >
+    WARNING SERVICE ACCOUNT TOKEN ACCESS - SA token read from unusual pod
+    (file=%fd.name
+     process=%proc.name pid=%proc.pid
+     command=%proc.cmdline
+     parent=%proc.pname
+     user=%user.name uid=%user.uid
+     container_id=%container.id
+     container_name=%container.name
+     image=%container.image.repository:%container.image.tag
+     k8s_pod=%k8s.pod.name
+     k8s_ns=%k8s.ns.name
+     k8s_sa=%k8s.pod.service_account)
+  priority: WARNING
+  tags:
+    - apt
+    - credential_access
+    - lateral_movement
+    - mitre_t1528
+    - mitre_steal_application_access_token
+    - mitre_t1550
+    - mitre_use_alternate_auth_material
+    - service_account
+  source: syscall
+  enabled: true
+
+# =============================================================================
+# RULE 7: Reverse Shell Detected
+# =============================================================================
+# Reverse shells are the primary mechanism for APT groups to establish
+# interactive access to compromised containers. Detection covers bash,
+# netcat, python, perl, and other common reverse shell techniques.
+#
+# MITRE ATT&CK: T1059 (Command and Scripting Interpreter)
+# =============================================================================
+
+- rule: Reverse Shell Detected in Container
+  desc: >
+    Detects common reverse shell patterns used by attackers to establish
+    interactive remote access to compromised containers. Covers multiple
+    techniques including bash -i redirected to network, netcat with -e flag,
+    python pty.spawn, perl socket shells, and socat TTY connections.
+    This is a critical indicator of active exploitation.
+  condition: >
+    spawned_process and
+    container and
+    (
+      # Bash reverse shell: bash -i >& /dev/tcp/...
+      (proc.name = bash and
+       (proc.cmdline contains "/dev/tcp/" or
+        proc.cmdline contains "/dev/udp/" or
+        proc.cmdline contains "bash -i")) or
+      # Netcat reverse shell: nc -e /bin/sh
+      (proc.name in (nc, ncat, netcat) and
+       (proc.cmdline contains "-e " or
+        proc.cmdline contains "-c " or
+        proc.cmdline contains "exec")) or
+      # Python reverse shell: python -c 'import pty; pty.spawn'
+      (proc.name in (python, python2, python3) and
+       (proc.cmdline contains "pty.spawn" or
+        proc.cmdline contains "socket" and proc.cmdline contains "connect" or
+        proc.cmdline contains "subprocess.call" and proc.cmdline contains "/bin/sh" or
+        proc.cmdline contains "os.dup2")) or
+      # Perl reverse shell
+      (proc.name = perl and
+       (proc.cmdline contains "socket" and proc.cmdline contains "exec" or
+        proc.cmdline contains "IO::Socket")) or
+      # PHP reverse shell
+      (proc.name in (php, php7, php8) and
+       (proc.cmdline contains "fsockopen" or
+        proc.cmdline contains "exec(" or
+        proc.cmdline contains "shell_exec")) or
+      # Ruby reverse shell
+      (proc.name in (ruby, irb) and
+       proc.cmdline contains "TCPSocket" and proc.cmdline contains "exec") or
+      # Socat reverse shell
+      (proc.name = socat and
+       proc.cmdline contains "TCP:" and
+       (proc.cmdline contains "EXEC:" or proc.cmdline contains "PTY")) or
+      # Generic: mkfifo-based pipe shell
+      (proc.cmdline contains "mkfifo" and proc.cmdline contains "/bin/sh") or
+      # Generic: /bin/sh with network redirection
+      (proc.name = sh and proc.cmdline contains ">/dev/tcp/")
+    )
+  output: >
+    EMERGENCY REVERSE SHELL DETECTED - Active remote access to container
+    (process=%proc.name pid=%proc.pid
+     command=%proc.cmdline
+     parent=%proc.pname
+     user=%user.name uid=%user.uid
+     container_id=%container.id
+     container_name=%container.name
+     image=%container.image.repository:%container.image.tag
+     k8s_pod=%k8s.pod.name
+     k8s_ns=%k8s.ns.name
+     k8s_sa=%k8s.pod.service_account
+     network=%fd.name)
+  priority: EMERGENCY
+  tags:
+    - apt
+    - russian_apt
+    - reverse_shell
+    - remote_access
+    - mitre_t1059
+    - mitre_command_scripting_interpreter
+    - mitre_t1059_004
+    - mitre_unix_shell
+  source: syscall
+  enabled: true
+
+# =============================================================================
+# RULE 8: Suspicious File Download in Container
+# =============================================================================
+# APT groups download additional tools and payloads after initial access.
+# Detecting wget/curl to suspicious destinations or downloading executables
+# is an important early warning.
+#
+# MITRE ATT&CK: T1105 (Ingress Tool Transfer)
+# =============================================================================
+
+- rule: Suspicious File Download in Container
+  desc: >
+    Detects use of common download utilities (wget, curl, fetch) inside
+    containers to download potentially malicious files. While not all
+    downloads are malicious, downloading binaries or scripts to /tmp is
+    a common post-exploitation pattern.
+  condition: >
+    spawned_process and
+    container and
+    proc.name in (wget, curl, fetch) and
+    (proc.cmdline contains "/tmp/" or
+     proc.cmdline contains ".sh" or
+     proc.cmdline contains ".py" or
+     proc.cmdline contains ".elf" or
+     proc.cmdline contains ".bin" or
+     proc.cmdline contains "pastebin.com" or
+     proc.cmdline contains "paste.ee" or
+     proc.cmdline contains "transfer.sh" or
+     proc.cmdline contains "raw.githubusercontent.com" or
+     proc.cmdline contains ".onion")
+  output: >
+    WARNING SUSPICIOUS DOWNLOAD - File download detected in container
+    (process=%proc.name pid=%proc.pid
+     command=%proc.cmdline
+     parent=%proc.pname
+     user=%user.name uid=%user.uid
+     container_id=%container.id
+     container_name=%container.name
+     image=%container.image.repository:%container.image.tag
+     k8s_pod=%k8s.pod.name
+     k8s_ns=%k8s.ns.name)
+  priority: WARNING
+  tags:
+    - apt
+    - ingress_tool_transfer
+    - mitre_t1105
+    - mitre_ingress_tool_transfer
+    - download
+  source: syscall
+  enabled: true
+
+# =============================================================================
+# RULE 9: Sensitive File Access in Container
+# =============================================================================
+# Attackers frequently read /etc/shadow, /etc/passwd, and SSH keys to
+# harvest credentials for lateral movement.
+#
+# MITRE ATT&CK: T1552 (Unsecured Credentials)
+# =============================================================================
+
+- rule: Sensitive File Access in Container
+  desc: >
+    Detects reading of sensitive files inside containers including password
+    files, SSH keys, cloud credentials, and Kubernetes secrets mounted as
+    files. This is a common post-exploitation activity for credential
+    harvesting and lateral movement preparation.
+  condition: >
+    open_read and
+    container and
+    (fd.name = /etc/shadow or
+     fd.name startswith /root/.ssh/ or
+     fd.name startswith /home/ and fd.name contains ".ssh/" or
+     fd.name contains ".kube/config" or
+     fd.name contains "credentials.json" or
+     fd.name contains "application_default_credentials" or
+     fd.name contains ".aws/credentials" or
+     fd.name contains ".gcp/credentials") and
+    not proc.name in (sshd, ssh, login, su, sudo, passwd)
+  output: >
+    WARNING SENSITIVE FILE ACCESS - Credential file read in container
+    (file=%fd.name
+     process=%proc.name pid=%proc.pid
+     command=%proc.cmdline
+     parent=%proc.pname
+     user=%user.name uid=%user.uid
+     container_id=%container.id
+     container_name=%container.name
+     image=%container.image.repository:%container.image.tag
+     k8s_pod=%k8s.pod.name
+     k8s_ns=%k8s.ns.name)
+  priority: WARNING
+  tags:
+    - apt
+    - credential_access
+    - mitre_t1552
+    - mitre_unsecured_credentials
+    - sensitive_files
+  source: syscall
+  enabled: true
+
+# =============================================================================
+# RULE 10: Anomalous DNS Activity (DNS Tunneling / DGA)
+# =============================================================================
+# APT groups use DNS tunneling for data exfiltration and C2 communication.
+# Detecting high-volume DNS queries or queries to suspicious TLDs is important.
+#
+# MITRE ATT&CK: T1071.004 (DNS), T1048.003 (Exfiltration Over Unencrypted Protocol)
+# =============================================================================
+
+- rule: Suspicious DNS Tool Execution
+  desc: >
+    Detects execution of DNS lookup tools (dig, nslookup, host) inside
+    containers. While occasional DNS lookups are normal, these tools are
+    commonly used during reconnaissance and can indicate DNS tunneling
+    or domain enumeration activity.
+  condition: >
+    spawned_process and
+    container and
+    proc.name in (dig, nslookup, host, dnsrecon, fierce, dnsenum) and
+    not k8s.ns.name = "kube-system"
+  output: >
+    NOTICE DNS TOOL EXECUTION - DNS reconnaissance tool used in container
+    (process=%proc.name pid=%proc.pid
+     command=%proc.cmdline
+     parent=%proc.pname
+     user=%user.name uid=%user.uid
+     container_id=%container.id
+     container_name=%container.name
+     k8s_pod=%k8s.pod.name
+     k8s_ns=%k8s.ns.name)
+  priority: NOTICE
+  tags:
+    - apt
+    - reconnaissance
+    - dns
+    - mitre_t1071_004
+    - mitre_dns
+    - mitre_t1048
+    - mitre_exfiltration
+  source: syscall
+  enabled: true

@@ -1,0 +1,340 @@
+# =============================================================================
+# Trivy Operator Helm Values - Production Configuration
+# =============================================================================
+# Chart: aquasecurity/trivy-operator
+# Repository: https://aquasecurity.github.io/helm-charts/
+#
+# This values file configures the Trivy Operator for a GKE production
+# environment with comprehensive security scanning capabilities:
+#   - Vulnerability scanning of container images
+#   - Configuration audit scanning (Kubernetes misconfigurations)
+#   - Exposed secret detection in container images
+#   - SBOM (Software Bill of Materials) generation
+#   - Compliance reporting (NSA, CIS benchmarks)
+#   - Structured logging to stdout for GKE log collection
+#
+# PREREQUISITES:
+#   - GKE cluster with Workload Identity enabled
+#   - Kubernetes 1.25+ (for Pod Security Standards support)
+#   - Sufficient node resources for scan jobs
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Operator Deployment Configuration
+# -----------------------------------------------------------------------------
+# The operator itself runs as a Deployment in the trivy-system namespace.
+# It watches for workload changes and schedules scan jobs accordingly.
+# -----------------------------------------------------------------------------
+operator:
+  # -- Number of operator replicas. Single replica is sufficient for most
+  # clusters; the operator uses leader election for HA if scaled up.
+  replicas: 1
+
+  # -- Log level for the operator. Use "0" for INFO level in production.
+  # Increase for debugging: 1=DEBUG, 2=TRACE
+  logDevMode: false
+
+  # -- Metrics endpoint for Prometheus scraping
+  metricsBindAddress: ":8080"
+  healthBindAddress: ":9090"
+
+  # -- Leader election ensures only one replica processes events at a time
+  leaderElectionEnabled: true
+  leaderElectionId: "trivy-operator-lock"
+
+  # -- Vulnerability scan worker concurrency.
+  # Tune based on cluster size and node resources.
+  vulnerabilityScannerScanOnlyCurrentRevisions: true
+  configAuditScannerScanOnlyCurrentRevisions: true
+  batchDeleteLimit: 10
+  batchDeleteDelay: "10s"
+
+# -----------------------------------------------------------------------------
+# Trivy Scanner Configuration
+# -----------------------------------------------------------------------------
+# Configures the embedded Trivy scanner that runs as Kubernetes Jobs.
+# In "Standalone" mode, each scan job downloads the DB independently.
+# In "ClientServer" mode, a persistent Trivy server handles scanning.
+# Standalone mode is recommended for GKE with good egress connectivity.
+# -----------------------------------------------------------------------------
+trivy:
+  # -- Scanner mode: Standalone or ClientServer
+  # Standalone: Each scan job runs its own Trivy instance
+  # ClientServer: Scans are offloaded to a persistent Trivy server
+  mode: Standalone
+
+  # -- Trivy image configuration
+  # The operator uses this image for scan jobs
+  repository: ghcr.io/aquasecurity/trivy
+  tag: "0.58.0"
+  imagePullPolicy: IfNotPresent
+
+  # -- Severity levels to report.
+  # Options: UNKNOWN, LOW, MEDIUM, HIGH, CRITICAL
+  severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+
+  # -- Slow mode reduces Trivy's resource consumption at the cost of speed.
+  # Recommended for production to avoid resource spikes on nodes.
+  slow: true
+
+  # -- Skip update of the vulnerability DB on each scan.
+  # When false, Trivy checks for DB updates before each scan.
+  # Set to true and use dbRepository caching for air-gapped environments.
+  skipDBUpdate: false
+  skipJavaDBUpdate: false
+
+  # -- Vulnerability database OCI repository.
+  # The DB is downloaded as a compressed OCI artifact using gzip/zstd.
+  # For air-gapped environments, mirror this to a private registry.
+  dbRepository: ghcr.io/aquasecurity/trivy-db
+  dbRepositoryInsecure: false
+
+  # -- Java vulnerability database repository
+  javaDbRepository: ghcr.io/aquasecurity/trivy-java-db
+
+  # -- Timeout for each scan job (in duration format)
+  timeout: "10m0s"
+
+  # -- Additional Trivy flags for scan jobs
+  # --cache-dir is set by the operator; do not override here
+  additionalVulnerabilityReportFields: ""
+
+  # -- Use embedded policies for config audit scanning
+  useBuiltinRegoPolicies: true
+
+  # -- Resource configuration for scan jobs.
+  # These are critical for GKE to prevent node resource exhaustion.
+  # Trivy DB download + image scanning is memory-intensive.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+  # -- Configure insecure registries (if needed for private GCR/Artifact Registry)
+  insecureRegistries: {}
+
+  # -- Registry mirror configuration for air-gapped or performance optimization
+  mirrors: []
+
+  # -- Trivy server configuration (only used in ClientServer mode)
+  server:
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+
+# -----------------------------------------------------------------------------
+# Scanning Feature Flags
+# -----------------------------------------------------------------------------
+# Enable or disable individual scanning capabilities.
+# Each feature generates corresponding Kubernetes CRD reports.
+# -----------------------------------------------------------------------------
+
+# -- Vulnerability scanning: Scans container images for known CVEs.
+# Generates VulnerabilityReport CRDs per workload.
+vulnerabilityReportsPlugin: "Trivy"
+
+# -- Config audit scanning: Checks Kubernetes resource configurations
+# against security best practices (OPA/Rego policies).
+# Generates ConfigAuditReport CRDs per workload.
+configAuditReportsPlugin: "Trivy"
+
+# -- Compliance reporting configuration
+compliance:
+  # -- Enable compliance reporting against security frameworks
+  # Generates ClusterComplianceReport CRDs
+  cron: "0 */6 * * *"
+  reportType: "summary"
+  specs:
+    - nsa
+    - cis
+
+# -----------------------------------------------------------------------------
+# Scan Job Configuration for GKE
+# -----------------------------------------------------------------------------
+# Configure how scan jobs run on GKE nodes. These settings ensure scans
+# run reliably without disrupting production workloads.
+# -----------------------------------------------------------------------------
+scanJob:
+  # -- Create scan jobs in the operator's namespace (trivy-system)
+  # rather than in the workload's namespace
+  createScanJobsInOperatorNamespace: true
+
+  # -- Timeout for scan jobs. Jobs exceeding this are terminated.
+  ttlSecondsAfterFinished: 300
+
+  # -- Annotations for scan job pods.
+  # The sidecar injection annotation prevents Istio/service-mesh sidecars
+  # from being injected into short-lived scan jobs.
+  podTemplateLabels: {}
+  podTemplateAnnotations:
+    sidecar.istio.io/inject: "false"
+    cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
+
+  # -- Node selector for scan jobs.
+  # Use this to run scans on dedicated node pools in GKE.
+  nodeSelector: {}
+    # cloud.google.com/gke-nodepool: security-scanning
+
+  # -- Tolerations for scan jobs.
+  # Add tolerations if scan jobs should run on tainted nodes.
+  tolerations: []
+    # - key: "dedicated"
+    #   operator: "Equal"
+    #   value: "security-scanning"
+    #   effect: "NoSchedule"
+
+  # -- Pod security context for scan jobs
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    fsGroup: 65534
+
+  # -- Container security context for scan jobs
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+
+  # -- Compression of scan results stored in CRDs.
+  # Recommended for large clusters to reduce etcd storage pressure.
+  compressLogs: true
+
+# -----------------------------------------------------------------------------
+# Scanning Targets
+# -----------------------------------------------------------------------------
+# Define which scanner types are enabled. Each scanner produces
+# corresponding CRD reports.
+# -----------------------------------------------------------------------------
+scanners:
+  vulnerability:
+    enabled: true
+  configAudit:
+    enabled: true
+  exposedSecrets:
+    enabled: true
+  rbacAssessment:
+    enabled: true
+  infraAssessment:
+    enabled: true
+
+# -- SBOM (Software Bill of Materials) generation.
+# Generates CycloneDX SBOM reports for each scanned workload.
+# Useful for supply chain security and license compliance.
+sbomGeneration:
+  enabled: true
+
+# -----------------------------------------------------------------------------
+# Operator Pod Resources
+# -----------------------------------------------------------------------------
+# Resource limits for the operator pod itself (not scan jobs).
+# The operator is relatively lightweight but needs enough memory
+# to maintain its internal state and process events.
+# -----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# -----------------------------------------------------------------------------
+# Logging Configuration
+# -----------------------------------------------------------------------------
+# Trivy Operator logs are sent to stdout in JSON format for collection
+# by GKE's built-in logging agent (Fluent Bit / Cloud Logging).
+# No sidecar log collectors are needed on GKE.
+# -----------------------------------------------------------------------------
+# The operator logs to stdout by default. These environment variables
+# configure structured JSON logging for Cloud Logging integration.
+envVars:
+  - name: OPERATOR_LOG_DEV_MODE
+    value: "false"
+  - name: OPERATOR_SCANNER_REPORT_TTL
+    value: "24h"
+  - name: OPERATOR_BATCH_DELETE_LIMIT
+    value: "10"
+  - name: OPERATOR_BATCH_DELETE_DELAY
+    value: "10s"
+
+# -----------------------------------------------------------------------------
+# Service Account & RBAC
+# -----------------------------------------------------------------------------
+# The operator needs cluster-wide RBAC to watch workloads and create
+# scan jobs. On GKE with Workload Identity, annotate the service account
+# to map to a Google Cloud service account for pulling from Artifact Registry.
+# -----------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: "trivy-operator"
+  annotations: {}
+    # For GKE Workload Identity integration:
+    # iam.gke.io/gcp-service-account: trivy-operator@<PROJECT_ID>.iam.gserviceaccount.com
+
+# -----------------------------------------------------------------------------
+# Pod Disruption Budget
+# -----------------------------------------------------------------------------
+# Ensures the operator remains available during node upgrades.
+# -----------------------------------------------------------------------------
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# -----------------------------------------------------------------------------
+# Network Policy
+# -----------------------------------------------------------------------------
+# Restrict operator network access to only what's needed:
+# - Kubernetes API server (for CRD management)
+# - Container registries (for image scanning)
+# - Trivy DB repository (for vulnerability DB updates)
+# -----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+
+# -----------------------------------------------------------------------------
+# Priority Class
+# -----------------------------------------------------------------------------
+# Assign a priority class to ensure the operator is not evicted
+# during resource pressure on GKE nodes.
+# -----------------------------------------------------------------------------
+priorityClassName: "system-cluster-critical"
+
+# -----------------------------------------------------------------------------
+# Monitoring & Observability
+# -----------------------------------------------------------------------------
+# ServiceMonitor for Prometheus Operator integration.
+# Metrics include scan counts, durations, and error rates.
+# -----------------------------------------------------------------------------
+serviceMonitor:
+  enabled: true
+  interval: "60s"
+  labels: {}
+    # release: prometheus-stack
+
+# -----------------------------------------------------------------------------
+# Namespace Exclusions
+# -----------------------------------------------------------------------------
+# Exclude system namespaces from scanning to reduce noise and
+# resource consumption. GKE system namespaces are excluded by default.
+# -----------------------------------------------------------------------------
+excludeNamespaces: "kube-system,kube-public,kube-node-lease,gke-managed-system,gke-managed-cim,config-management-system,config-management-monitoring,gatekeeper-system"
+
+# -----------------------------------------------------------------------------
+# Target Namespaces (Optional)
+# -----------------------------------------------------------------------------
+# If set, only scan workloads in these namespaces.
+# Leave empty to scan all namespaces (except excluded ones).
+# -----------------------------------------------------------------------------
+targetNamespaces: ""

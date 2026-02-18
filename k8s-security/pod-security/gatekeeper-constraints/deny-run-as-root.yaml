@@ -1,0 +1,197 @@
+# =============================================================================
+# OPA Gatekeeper Constraint: Deny Running as Root
+# =============================================================================
+#
+# PURPOSE: Prevents pods from running containers as the root user (UID 0).
+# Running as root inside a container significantly increases the impact
+# of any container escape vulnerability.
+#
+# WHAT IT BLOCKS:
+#   - Containers with runAsUser: 0
+#   - Containers without runAsNonRoot: true
+#   - Pods without runAsNonRoot: true at the pod level
+#
+# WHY THIS MATTERS:
+#   When a container runs as root (UID 0):
+#   - Container escape CVEs become exploitable (CVE-2022-0185, CVE-2022-0492)
+#   - Host files are accessible if the container escapes
+#   - Kernel capabilities are more dangerous
+#   - Setuid binaries can be exploited
+#
+#   Running as non-root reduces the attack surface dramatically, even
+#   if other security controls fail.
+#
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# ConstraintTemplate: Deny running as root
+# ---------------------------------------------------------------------------
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sdenyrunasroot
+  annotations:
+    description: "Requires all containers to run as non-root user"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sDenyRunAsRoot
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            exemptImages:
+              type: array
+              description: "Images exempt from this policy"
+              items:
+                type: string
+            allowedRunAsUser:
+              type: object
+              description: "Allowed UID ranges"
+              properties:
+                ranges:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      min:
+                        type: integer
+                      max:
+                        type: integer
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sdenyrunasroot
+
+        # ---------------------------------------------------------------
+        # Rule 1: Pod-level runAsNonRoot must be true
+        # (unless every container overrides it individually)
+        # ---------------------------------------------------------------
+        violation[{"msg": msg}] {
+            pod := input.review.object
+            not pod_has_non_root(pod.spec)
+            not all_containers_have_non_root(pod.spec)
+            msg := sprintf(
+                "DENIED: Pod '%s' does not set runAsNonRoot: true. " +
+                "Either set 'spec.securityContext.runAsNonRoot: true' at the pod level, " +
+                "or set it on every container's securityContext.",
+                [pod.metadata.name]
+            )
+        }
+
+        # ---------------------------------------------------------------
+        # Rule 2: No container should explicitly set runAsUser: 0
+        # ---------------------------------------------------------------
+        violation[{"msg": msg}] {
+            container := input.review.object.spec.containers[_]
+            not is_exempt(container.image)
+            container.securityContext.runAsUser == 0
+            msg := sprintf(
+                "DENIED: Container '%s' in pod '%s' sets runAsUser: 0 (root). " +
+                "Use a non-root UID (e.g., 65534 for 'nobody'). " +
+                "Update the container image to run as non-root.",
+                [container.name, input.review.object.metadata.name]
+            )
+        }
+
+        # Same check for init containers
+        violation[{"msg": msg}] {
+            container := input.review.object.spec.initContainers[_]
+            not is_exempt(container.image)
+            container.securityContext.runAsUser == 0
+            msg := sprintf(
+                "DENIED: Init container '%s' in pod '%s' sets runAsUser: 0 (root).",
+                [container.name, input.review.object.metadata.name]
+            )
+        }
+
+        # ---------------------------------------------------------------
+        # Rule 3: Pod-level runAsUser must not be 0
+        # ---------------------------------------------------------------
+        violation[{"msg": msg}] {
+            input.review.object.spec.securityContext.runAsUser == 0
+            msg := sprintf(
+                "DENIED: Pod '%s' sets runAsUser: 0 (root) at the pod level. " +
+                "Use a non-root UID.",
+                [input.review.object.metadata.name]
+            )
+        }
+
+        # ---------------------------------------------------------------
+        # Rule 4: Validate UID is in allowed range (if specified)
+        # ---------------------------------------------------------------
+        violation[{"msg": msg}] {
+            container := input.review.object.spec.containers[_]
+            not is_exempt(container.image)
+            uid := container.securityContext.runAsUser
+            uid != null
+            uid > 0
+            count(input.parameters.allowedRunAsUser.ranges) > 0
+            not uid_in_range(uid)
+            msg := sprintf(
+                "DENIED: Container '%s' in pod '%s' uses UID %d which is " +
+                "outside the allowed ranges.",
+                [container.name, input.review.object.metadata.name, uid]
+            )
+        }
+
+        # ---------------------------------------------------------------
+        # Helper functions
+        # ---------------------------------------------------------------
+
+        # Check if pod has runAsNonRoot: true
+        pod_has_non_root(spec) {
+            spec.securityContext.runAsNonRoot == true
+        }
+
+        # Check if all containers have runAsNonRoot: true
+        all_containers_have_non_root(spec) {
+            containers := spec.containers
+            count(containers) > 0
+            count([c | c := containers[_]; container_has_non_root(c)]) == count(containers)
+        }
+
+        container_has_non_root(container) {
+            container.securityContext.runAsNonRoot == true
+        }
+
+        # Check if UID is in allowed range
+        uid_in_range(uid) {
+            range := input.parameters.allowedRunAsUser.ranges[_]
+            uid >= range.min
+            uid <= range.max
+        }
+
+        # Exempt image check
+        is_exempt(image) {
+            exempt := input.parameters.exemptImages[_]
+            glob.match(exempt, ["/"], image)
+        }
+
+---
+# ---------------------------------------------------------------------------
+# Constraint: Enforce non-root across the cluster
+# ---------------------------------------------------------------------------
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sDenyRunAsRoot
+metadata:
+  name: deny-run-as-root
+  annotations:
+    description: "Deny pods that run as root (UID 0)"
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces:
+      - kube-system
+      - gatekeeper-system
+  parameters:
+    exemptImages: []
+    allowedRunAsUser:
+      ranges:
+        # Allow UIDs 1000-65534 (non-root range)
+        - min: 1000
+          max: 65534

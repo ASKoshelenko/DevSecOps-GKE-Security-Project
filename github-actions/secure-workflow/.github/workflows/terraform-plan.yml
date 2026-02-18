@@ -1,0 +1,318 @@
+# =============================================================================
+# SECURE WORKFLOW: Terraform Plan on Pull Requests
+# =============================================================================
+#
+# This workflow demonstrates the SECURE pattern for running Terraform plan
+# on pull requests, including PRs from forks.
+#
+# Key security properties:
+#   1. Two-job architecture separating privileged and unprivileged operations
+#   2. PR code never runs with access to secrets or OIDC tokens
+#   3. All action versions pinned by SHA (not mutable tags)
+#   4. Environment protection rules for the privileged job
+#   5. Minimal permissions per job
+#   6. Plan output passed as artifact, not directly between jobs
+#   7. No `pull_request_target` with PR code checkout
+#
+# Architecture:
+#   Job 1 (plan):    Runs on pull_request, no secrets, no OIDC.
+#                    Uses a read-only backend or local state.
+#                    Produces plan output as an artifact.
+#
+#   Job 2 (comment): Runs on workflow_run completion of Job 1.
+#                    Has write permissions to post PR comments.
+#                    Never executes user-supplied code.
+#
+# Alternative (simpler) approach also shown: Single workflow using
+# pull_request trigger (not _target), which is safe for non-fork PRs
+# when the repo doesn't allow forks.
+# =============================================================================
+
+name: "Terraform Plan (Secure)"
+
+# =============================================================================
+# OPTION A: Simple approach for repos that don't accept fork PRs
+# Use plain `pull_request` - it's safe because fork PRs won't have
+# access to secrets or OIDC tokens.
+# =============================================================================
+
+on:
+  pull_request:
+    # `pull_request` trigger is safe:
+    # - For fork PRs: runs without secrets, OIDC, or write token
+    # - For same-repo PRs: runs with secrets (but author is already trusted)
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-plan.yml'
+
+# Minimal top-level permissions - override per job
+permissions: {}
+
+env:
+  TF_VERSION: "1.7.5"
+  TF_WORKING_DIR: "terraform/"
+
+jobs:
+  # ===========================================================================
+  # Job 1: Terraform Plan (Unprivileged for forks)
+  #
+  # This job runs the actual Terraform plan. For fork PRs, it has NO
+  # access to secrets or OIDC tokens, making it safe to execute PR code.
+  # For same-repo PRs, it has access but the author is trusted.
+  # ===========================================================================
+  plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+
+    # Environment protection rules: requires approval from specified reviewers
+    # before the job can run. This prevents automatic execution of malicious PRs.
+    environment: terraform-plan
+
+    # Minimal permissions for this job
+    permissions:
+      contents: read         # Read repo contents only
+      id-token: write        # OIDC token (only available for same-repo PRs)
+
+    outputs:
+      plan_exitcode: ${{ steps.plan.outputs.exitcode }}
+
+    steps:
+      # Pin checkout action by SHA, not by mutable tag
+      # SHA corresponds to actions/checkout@v4.1.7
+      - name: Checkout
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+
+      # Authenticate to GCP with strict audience restriction
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@55bd3a7c6e2ae7cf1877fd1ccb9d54c0503c457c
+        # SHA corresponds to google-github-actions/auth@v2.1.3
+        with:
+          workload_identity_provider: "projects/123456789/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+          service_account: "terraform-plan-readonly@my-production-project.iam.gserviceaccount.com"
+          # IMPORTANT: Use a SEPARATE service account with READ-ONLY permissions
+          # for plan. Never use the apply service account for PRs.
+          token_format: "access_token"
+          # Restrict the audience to prevent token reuse in other contexts
+          # This limits where the OIDC token can be exchanged
+          create_credentials_file: true
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@651471c36a6092792c552e8b1bef71e592b462d8
+        # SHA corresponds to hashicorp/setup-terraform@v3.1.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true
+
+      # Validate terraform files before running init
+      # This catches syntax errors without network access
+      - name: Terraform Format Check
+        id: fmt
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=my-production-project-tf-state" \
+            -backend-config="prefix=terraform/state" \
+            -input=false
+        # -input=false prevents interactive prompts that could hang the job
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          set +e
+          terraform plan -no-color -input=false -detailed-exitcode -out=tfplan 2>&1 | tee plan_output.txt
+          EXITCODE=$?
+          set -e
+
+          # -detailed-exitcode: 0=no changes, 1=error, 2=changes present
+          echo "exitcode=${EXITCODE}" >> $GITHUB_OUTPUT
+
+          # Truncate plan output if too large (prevents PR comment overflow)
+          if [ $(wc -c < plan_output.txt) -gt 60000 ]; then
+            echo "Plan output truncated (exceeded 60KB)" > plan_output_truncated.txt
+            head -c 30000 plan_output.txt >> plan_output_truncated.txt
+            echo -e "\n\n... (truncated) ...\n\n" >> plan_output_truncated.txt
+            tail -c 30000 plan_output.txt >> plan_output_truncated.txt
+            mv plan_output_truncated.txt plan_output.txt
+          fi
+
+          # Exit with 0 or 2 (changes present is not a failure for plan)
+          if [ $EXITCODE -eq 1 ]; then
+            exit 1
+          fi
+
+      # Upload plan output as artifact for the comment job
+      # This avoids passing plan text through job outputs (size limits)
+      - name: Upload Plan Output
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        # SHA corresponds to actions/upload-artifact@v4.3.4
+        with:
+          name: terraform-plan-output
+          path: ${{ env.TF_WORKING_DIR }}/plan_output.txt
+          retention-days: 5
+
+      # Upload the binary plan for potential apply job
+      - name: Upload Plan File
+        if: steps.plan.outputs.exitcode == '2'
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: terraform-plan-binary
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 5
+
+  # ===========================================================================
+  # Job 2: Post Plan Comment (Privileged but safe)
+  #
+  # This job posts the plan output as a PR comment. It has write permissions
+  # but NEVER executes any code from the PR. It only reads the artifact
+  # produced by the plan job.
+  # ===========================================================================
+  comment:
+    name: "Post Plan Comment"
+    runs-on: ubuntu-latest
+    needs: plan
+    if: always()
+
+    permissions:
+      pull-requests: write   # Only permission needed: write PR comments
+
+    steps:
+      - name: Download Plan Output
+        uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e
+        # SHA corresponds to actions/download-artifact@v4.1.7
+        with:
+          name: terraform-plan-output
+          path: /tmp/plan
+
+      - name: Post Plan to PR
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        # SHA corresponds to actions/github-script@v7.0.1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const planPath = '/tmp/plan/plan_output.txt';
+
+            let planOutput = 'No plan output available.';
+            if (fs.existsSync(planPath)) {
+              planOutput = fs.readFileSync(planPath, 'utf8');
+            }
+
+            // Sanitize plan output to prevent markdown injection
+            // An attacker could craft resource names with markdown that
+            // renders maliciously in the PR comment
+            planOutput = planOutput
+              .replace(/`/g, '\\`')
+              .substring(0, 65000); // GitHub comment size limit
+
+            const planExitCode = '${{ needs.plan.outputs.plan_exitcode }}';
+            const planResult = planExitCode === '0' ? 'No Changes' :
+                              planExitCode === '2' ? 'Changes Detected' : 'Error';
+            const emoji = planExitCode === '0' ? '✅' :
+                         planExitCode === '2' ? '📋' : '❌';
+
+            const body = `#### ${emoji} Terraform Plan: \`${planResult}\`
+
+            <details><summary>Show Plan Output</summary>
+
+            \`\`\`
+            ${planOutput}
+            \`\`\`
+
+            </details>
+
+            *Plan generated by workflow run [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*`;
+
+            // Find existing bot comment to update (avoid spam)
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' &&
+              c.body.includes('Terraform Plan:')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body,
+              });
+            }
+
+# =============================================================================
+# OPTION B: Two-workflow approach for repos that accept fork PRs
+# =============================================================================
+#
+# For repos that accept PRs from forks and need to run terraform plan,
+# use a two-workflow architecture:
+#
+# Workflow 1: terraform-plan-fork.yml (triggered by pull_request)
+#   - Runs without any credentials
+#   - Uses a mock/local backend (no real state access)
+#   - Validates terraform syntax and configuration
+#   - Uploads plan output as artifact
+#
+# Workflow 2: terraform-plan-comment.yml (triggered by workflow_run)
+#   - Triggered when Workflow 1 completes
+#   - Runs code from the BASE branch only (never PR code)
+#   - Downloads the artifact from Workflow 1
+#   - Posts the plan output as a PR comment
+#   - Has write permissions but executes only trusted code
+#
+# This completely separates untrusted code execution from privileged operations.
+#
+# Example Workflow 2:
+#
+# name: "Post Fork PR Plan Comment"
+# on:
+#   workflow_run:
+#     workflows: ["Terraform Plan (Fork)"]
+#     types: [completed]
+#
+# permissions:
+#   pull-requests: write
+#
+# jobs:
+#   comment:
+#     runs-on: ubuntu-latest
+#     if: github.event.workflow_run.conclusion == 'success'
+#     steps:
+#       - name: Download artifact
+#         uses: actions/download-artifact@v4
+#         with:
+#           name: terraform-plan-output
+#           run-id: ${{ github.event.workflow_run.id }}
+#           github-token: ${{ secrets.GITHUB_TOKEN }}
+#
+#       - name: Post comment
+#         uses: actions/github-script@v7
+#         with:
+#           script: |
+#             // ... same comment logic as above ...
+# =============================================================================

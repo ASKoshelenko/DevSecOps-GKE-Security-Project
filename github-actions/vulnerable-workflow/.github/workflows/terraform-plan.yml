@@ -1,0 +1,179 @@
+# =============================================================================
+# WARNING: VULNERABLE WORKFLOW - FOR EDUCATIONAL/SECURITY TESTING PURPOSES ONLY
+# =============================================================================
+#
+# This workflow demonstrates a critical vulnerability pattern in GitHub Actions
+# CI/CD pipelines that use Workload Identity Federation with GCP.
+#
+# VULNERABILITY: pull_request_target + explicit checkout of PR head ref
+#
+# pull_request_target runs in the context of the BASE branch (the target),
+# which means it has access to repository secrets, OIDC tokens, and write
+# permissions. However, if the workflow explicitly checks out the PR HEAD
+# (the attacker's fork/branch), untrusted code executes with full privileges.
+#
+# This is different from plain `pull_request`, which runs in the context of
+# the merge commit and does NOT have access to secrets in forked PRs.
+#
+# Real-world impact: An attacker who can open a PR against this repo gains:
+#   - A valid GCP access token via Workload Identity Federation
+#   - A GitHub token with write permissions to the repository
+#   - Ability to run arbitrary code in the CI environment
+#
+# DO NOT USE THIS WORKFLOW IN PRODUCTION.
+# =============================================================================
+
+name: "Terraform Plan (VULNERABLE)"
+
+on:
+  pull_request_target:
+    # VULNERABILITY: pull_request_target gives the workflow write permissions
+    # and access to secrets, even for PRs from forks. The workflow runs in
+    # the context of the base branch, but if we checkout the PR code below,
+    # we execute untrusted code with elevated privileges.
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-plan.yml'
+
+# VULNERABILITY: These permissions are granted even when running fork PR code
+permissions:
+  contents: read
+  pull-requests: write       # Can post comments, modify PR labels
+  id-token: write            # Can request OIDC tokens for Workload Identity Federation
+
+env:
+  TF_VERSION: "1.7.5"
+  TF_WORKING_DIR: "terraform/"
+  GCP_PROJECT_ID: "my-production-project"
+  GCP_WORKLOAD_IDENTITY_PROVIDER: "projects/123456789/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+  GCP_SERVICE_ACCOUNT: "terraform-ci@my-production-project.iam.gserviceaccount.com"
+  TF_STATE_BUCKET: "my-production-project-tf-state"
+
+jobs:
+  terraform-plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    # VULNERABILITY: No environment protection rules, no required reviewers
+    # environment: production  # This line is commented out - no protection!
+
+    steps:
+      # -----------------------------------------------------------------------
+      # VULNERABILITY: Checking out the PR head ref instead of the base branch.
+      # This means any code the attacker puts in their PR will be executed
+      # in subsequent steps with the workflow's elevated permissions.
+      # -----------------------------------------------------------------------
+      - name: Checkout PR Code
+        uses: actions/checkout@v4
+        with:
+          # CRITICAL VULNERABILITY: This checks out the attacker's code
+          ref: ${{ github.event.pull_request.head.sha }}
+          # If this were just `actions/checkout@v4` without `ref`, it would
+          # checkout the base branch (safe for pull_request_target).
+          # But with ref: head.sha, we get the PR author's untrusted code.
+
+      # -----------------------------------------------------------------------
+      # VULNERABILITY: Authenticating to GCP BEFORE validating the PR code.
+      # The OIDC token exchange happens, giving the workflow a valid GCP
+      # access token that the attacker's code (checked out above) can steal.
+      # -----------------------------------------------------------------------
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          token_format: "access_token"
+          # VULNERABILITY: The access token is now available as:
+          #   ${{ steps.auth.outputs.access_token }}
+          #   GOOGLE_OAUTH_ACCESS_TOKEN env var
+          #   CLOUDSDK_AUTH_ACCESS_TOKEN env var
+          # Any code running after this step can read these values.
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true
+
+      # -----------------------------------------------------------------------
+      # VULNERABILITY: terraform init downloads providers and modules defined
+      # in the PR's code. If the attacker added a malicious provider or module,
+      # it will be downloaded and its code executed during init/plan.
+      # -----------------------------------------------------------------------
+      - name: Terraform Init
+        id: init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=terraform/state"
+        # VULNERABILITY: This runs `terraform init` on the attacker's code.
+        # The attacker can:
+        #   1. Add malicious providers that execute code during init
+        #   2. Point to malicious Terraform modules
+        #   3. Change the backend to intercept state operations
+        #   4. Use external data sources that run scripts
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate -no-color
+
+      # -----------------------------------------------------------------------
+      # VULNERABILITY: terraform plan executes all data sources, provisioners,
+      # and provider logic. The attacker's malicious code runs here with access
+      # to the GCP token in the environment.
+      # -----------------------------------------------------------------------
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan_output.txt
+          echo "plan_exitcode=$?" >> $GITHUB_OUTPUT
+        continue-on-error: true
+        # VULNERABILITY: During plan execution:
+        #   - `external` data sources execute arbitrary scripts
+        #   - `http` data sources make arbitrary HTTP requests
+        #   - Custom providers execute arbitrary Go code
+        #   - local-exec provisioners in data sources run shell commands
+        # All of these run with GOOGLE_OAUTH_ACCESS_TOKEN in the environment.
+
+      # -----------------------------------------------------------------------
+      # VULNERABILITY: Even the comment-posting step is dangerous because it
+      # uses the PR number from the event, and the plan output could contain
+      # attacker-controlled content (injection into the comment body).
+      # -----------------------------------------------------------------------
+      - name: Post Plan to PR
+        uses: actions/github-script@v7
+        if: always()
+        env:
+          PLAN: ${{ steps.plan.outputs.stdout }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Plan \`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`terraform
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1

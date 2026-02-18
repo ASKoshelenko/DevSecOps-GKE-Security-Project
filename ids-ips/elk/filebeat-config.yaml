@@ -1,0 +1,476 @@
+# =============================================================================
+# Filebeat DaemonSet Configuration - Security Event Collection
+# =============================================================================
+#
+# Deploys Filebeat as a DaemonSet on GKE to collect security-relevant logs
+# from multiple sources and ship them to Logstash for enrichment, or
+# directly to Elasticsearch for simpler deployments.
+#
+# Log Sources Collected:
+#   1. Falco alerts      - /var/log/falco/events.json
+#   2. Suricata eve.json - /var/log/suricata/eve.json
+#   3. K8s audit logs    - /var/log/kubernetes/audit/audit.log
+#   4. Container logs    - /var/log/containers/*.log
+#
+# Apply with:
+#   kubectl apply -f filebeat-config.yaml -n monitoring
+#
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    app.kubernetes.io/part-of: ids-ips
+---
+# =============================================================================
+# ConfigMap - Filebeat Configuration
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: filebeat-config
+  namespace: monitoring
+  labels:
+    app: filebeat
+    app.kubernetes.io/part-of: ids-ips
+data:
+  filebeat.yml: |-
+    # -------------------------------------------------------------------------
+    # Filebeat Global Settings
+    # -------------------------------------------------------------------------
+    name: "filebeat-${NODE_NAME}"
+
+    # Logging configuration for Filebeat itself
+    logging.level: info
+    logging.to_stderr: true
+    logging.metrics.enabled: true
+    logging.metrics.period: 60s
+
+    # -------------------------------------------------------------------------
+    # Input: Falco Security Alerts
+    # -------------------------------------------------------------------------
+    # Falco writes JSON-formatted security alerts to this file.
+    # Each line is a complete JSON object representing one alert.
+    # These are our primary runtime detection events.
+    # -------------------------------------------------------------------------
+    filebeat.inputs:
+      - type: log
+        id: falco-alerts
+        enabled: true
+        paths:
+          - /var/log/falco/events.json
+        # Parse each line as JSON
+        json.keys_under_root: true
+        json.add_error_key: true
+        json.overwrite_keys: true
+        json.message_key: output
+        # Add metadata fields for pipeline routing
+        fields:
+          source: falco
+          log_type: security_alert
+          environment: production
+          pipeline: apt-detection
+        fields_under_root: true
+        # Multiline: Falco JSON is one event per line
+        multiline.type: pattern
+        multiline.pattern: '^\{'
+        multiline.negate: true
+        multiline.match: after
+        # Harvester settings
+        close_inactive: 5m
+        scan_frequency: 2s
+        # Prevent reprocessing on restart
+        clean_removed: true
+        # Tags for Logstash pipeline routing
+        tags: ["falco", "runtime-detection", "apt"]
+
+      # -----------------------------------------------------------------------
+      # Input: Suricata Eve JSON (Network IDS)
+      # -----------------------------------------------------------------------
+      # Suricata's eve.json contains all IDS events: alerts, flow records,
+      # DNS queries, TLS metadata, HTTP transactions, and statistics.
+      # This is the primary network-level detection data source.
+      # -----------------------------------------------------------------------
+      - type: log
+        id: suricata-eve
+        enabled: true
+        paths:
+          - /var/log/suricata/eve.json
+        json.keys_under_root: true
+        json.add_error_key: true
+        json.overwrite_keys: true
+        fields:
+          source: suricata
+          log_type: network_ids
+          environment: production
+          pipeline: apt-detection
+        fields_under_root: true
+        multiline.type: pattern
+        multiline.pattern: '^\{'
+        multiline.negate: true
+        multiline.match: after
+        close_inactive: 5m
+        scan_frequency: 2s
+        clean_removed: true
+        tags: ["suricata", "network-ids", "apt"]
+
+      # -----------------------------------------------------------------------
+      # Input: Kubernetes Audit Logs
+      # -----------------------------------------------------------------------
+      # GKE audit logs capture all API server interactions. These are critical
+      # for detecting unauthorized kubectl access, secret enumeration, RBAC
+      # manipulation, and service account abuse.
+      #
+      # On GKE, audit logs are available at this path when using
+      # --audit-log-path flag or through Cloud Logging export.
+      # -----------------------------------------------------------------------
+      - type: log
+        id: k8s-audit
+        enabled: true
+        paths:
+          - /var/log/kubernetes/audit/audit.log
+          - /var/log/kubernetes/audit/*.log
+        json.keys_under_root: true
+        json.add_error_key: true
+        json.overwrite_keys: true
+        fields:
+          source: kubernetes-audit
+          log_type: audit
+          environment: production
+          pipeline: k8s-security
+        fields_under_root: true
+        multiline.type: pattern
+        multiline.pattern: '^\{'
+        multiline.negate: true
+        multiline.match: after
+        close_inactive: 10m
+        scan_frequency: 5s
+        clean_removed: true
+        tags: ["kubernetes", "audit", "api-server"]
+
+      # -----------------------------------------------------------------------
+      # Input: Container Logs (all namespaces)
+      # -----------------------------------------------------------------------
+      # Collect container stdout/stderr logs for correlation with security
+      # events. Container logs may contain application-level IOCs such as
+      # error messages from exploitation attempts or malware output.
+      # -----------------------------------------------------------------------
+      - type: container
+        id: container-logs
+        enabled: true
+        paths:
+          - /var/log/containers/*.log
+        # Exclude noisy system containers to reduce volume
+        exclude_files:
+          - '.*kube-system.*'
+          - '.*falco-system.*'
+          - '.*suricata-system.*'
+          - '.*monitoring.*'
+        # Parse container log JSON wrapper
+        json.keys_under_root: false
+        json.add_error_key: true
+        fields:
+          source: container
+          log_type: application
+          environment: production
+        fields_under_root: true
+        close_inactive: 5m
+        scan_frequency: 10s
+        tags: ["container", "application"]
+
+        # Autodiscover: automatically detect new pods and add K8s metadata
+        processors:
+          - add_kubernetes_metadata:
+              host: ${NODE_NAME}
+              matchers:
+                - logs_path:
+                    logs_path: "/var/log/containers/"
+
+    # -------------------------------------------------------------------------
+    # Processors - Global Enrichment
+    # -------------------------------------------------------------------------
+    # These processors run on ALL inputs before output, adding system and
+    # Kubernetes metadata to every event for better correlation.
+    # -------------------------------------------------------------------------
+    processors:
+      # Add host metadata (hostname, OS, architecture)
+      - add_host_metadata:
+          when.not.contains.tags: forwarded
+
+      # Add cloud metadata (GCP project, region, zone, instance ID)
+      - add_cloud_metadata:
+          providers:
+            - gcp
+
+      # Add Kubernetes metadata (pod name, namespace, labels, annotations)
+      - add_kubernetes_metadata:
+          host: ${NODE_NAME}
+          default_indexers.enabled: true
+          default_matchers.enabled: true
+          # Include labels and annotations for filtering
+          labels.dedot: true
+          annotations.dedot: true
+
+      # Drop events with empty messages to reduce noise
+      - drop_event:
+          when:
+            equals:
+              message: ""
+
+      # Add a fingerprint for deduplication
+      - fingerprint:
+          fields: ["source", "message", "kubernetes.pod.name"]
+          target_field: "event.hash"
+          method: sha256
+
+    # -------------------------------------------------------------------------
+    # Output: Logstash
+    # -------------------------------------------------------------------------
+    # Send all events to Logstash for enrichment (GeoIP, APT tagging,
+    # parsing) before storage in Elasticsearch.
+    # -------------------------------------------------------------------------
+    output.logstash:
+      hosts: ["logstash:5044"]
+      # Load balancing across Logstash instances
+      loadbalance: true
+      # Retry on failure with backoff
+      backoff.init: 1s
+      backoff.max: 60s
+      # Bulk settings for throughput
+      bulk_max_size: 2048
+      # TLS for production (uncomment and configure)
+      # ssl.certificate_authorities: ["/etc/pki/tls/certs/logstash-ca.crt"]
+      # ssl.certificate: "/etc/pki/tls/certs/filebeat.crt"
+      # ssl.key: "/etc/pki/tls/private/filebeat.key"
+
+    # Alternatively, output directly to Elasticsearch (simpler, less enrichment):
+    # output.elasticsearch:
+    #   hosts: ["http://elasticsearch-master:9200"]
+    #   index: "security-events-%{+yyyy.MM.dd}"
+    #   pipeline: "apt-detection-pipeline"
+
+    # -------------------------------------------------------------------------
+    # Queue and Buffer Settings
+    # -------------------------------------------------------------------------
+    # Memory queue with disk spillover for reliability.
+    # Events are buffered in memory and spilled to disk if Logstash is slow.
+    # -------------------------------------------------------------------------
+    queue.mem:
+      events: 4096
+      flush.min_events: 512
+      flush.timeout: 5s
+
+    # -------------------------------------------------------------------------
+    # Monitoring
+    # -------------------------------------------------------------------------
+    # Enable HTTP endpoint for health checks and Prometheus scraping.
+    # -------------------------------------------------------------------------
+    http.enabled: true
+    http.host: "0.0.0.0"
+    http.port: 5066
+
+    monitoring.enabled: false
+---
+# =============================================================================
+# DaemonSet - Filebeat
+# =============================================================================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: filebeat
+  namespace: monitoring
+  labels:
+    app: filebeat
+    app.kubernetes.io/part-of: ids-ips
+    security.devsecops/component: log-collection
+spec:
+  selector:
+    matchLabels:
+      app: filebeat
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: filebeat
+        app.kubernetes.io/part-of: ids-ips
+      annotations:
+        # Force restart on config change
+        checksum/config: "{{ include (print .Template.BasePath \"/configmap.yaml\") . | sha256sum }}"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5066"
+        prometheus.io/path: "/stats"
+    spec:
+      serviceAccountName: filebeat
+      terminationGracePeriodSeconds: 30
+      priorityClassName: system-node-critical
+
+      # Run on all nodes
+      tolerations:
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+
+      containers:
+        - name: filebeat
+          image: docker.elastic.co/beats/filebeat:8.12.0
+          args:
+            - "-c"
+            - "/etc/filebeat/filebeat.yml"
+            - "-e"
+            - "--strict.perms=false"
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: ELASTICSEARCH_HOST
+              value: "elasticsearch-master"
+            - name: ELASTICSEARCH_PORT
+              value: "9200"
+            - name: LOGSTASH_HOST
+              value: "logstash"
+            - name: LOGSTASH_PORT
+              value: "5044"
+          securityContext:
+            runAsUser: 0
+            # Required for reading host log files
+            privileged: false
+            capabilities:
+              add:
+                - DAC_READ_SEARCH
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/filebeat/filebeat.yml
+              subPath: filebeat.yml
+              readOnly: true
+            - name: data
+              mountPath: /usr/share/filebeat/data
+            # Host log directories
+            - name: falco-logs
+              mountPath: /var/log/falco
+              readOnly: true
+            - name: suricata-logs
+              mountPath: /var/log/suricata
+              readOnly: true
+            - name: k8s-audit-logs
+              mountPath: /var/log/kubernetes/audit
+              readOnly: true
+            - name: container-logs
+              mountPath: /var/log/containers
+              readOnly: true
+            - name: docker-containers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+          ports:
+            - containerPort: 5066
+              name: monitoring
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 5066
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 5066
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+      volumes:
+        - name: config
+          configMap:
+            name: filebeat-config
+            defaultMode: 0640
+        - name: data
+          hostPath:
+            path: /var/lib/filebeat-data
+            type: DirectoryOrCreate
+        - name: falco-logs
+          hostPath:
+            path: /var/log/falco
+            type: DirectoryOrCreate
+        - name: suricata-logs
+          hostPath:
+            path: /var/log/suricata
+            type: DirectoryOrCreate
+        - name: k8s-audit-logs
+          hostPath:
+            path: /var/log/kubernetes/audit
+            type: DirectoryOrCreate
+        - name: container-logs
+          hostPath:
+            path: /var/log/containers
+            type: DirectoryOrCreate
+        - name: docker-containers
+          hostPath:
+            path: /var/lib/docker/containers
+            type: DirectoryOrCreate
+---
+# =============================================================================
+# RBAC - Filebeat Service Account and Cluster Role
+# =============================================================================
+# Filebeat needs cluster-wide read access to pod metadata for K8s enrichment.
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: filebeat
+  namespace: monitoring
+  labels:
+    app: filebeat
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: filebeat
+  labels:
+    app: filebeat
+rules:
+  - apiGroups: [""]
+    resources:
+      - namespaces
+      - pods
+      - nodes
+      - events
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources:
+      - replicasets
+      - deployments
+      - statefulsets
+      - daemonsets
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: filebeat
+  labels:
+    app: filebeat
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: filebeat
+subjects:
+  - kind: ServiceAccount
+    name: filebeat
+    namespace: monitoring

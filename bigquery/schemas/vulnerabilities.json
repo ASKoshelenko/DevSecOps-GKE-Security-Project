@@ -1,0 +1,110 @@
+[
+  {
+    "name": "vulnerability_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "CVE or vulnerability identifier (e.g., CVE-2023-12345)"
+  },
+  {
+    "name": "package_name",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Name of the affected software package"
+  },
+  {
+    "name": "installed_version",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Currently installed version of the package"
+  },
+  {
+    "name": "fixed_version",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Version that contains the fix, empty if no fix is available"
+  },
+  {
+    "name": "severity",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Vulnerability severity level: CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN"
+  },
+  {
+    "name": "cvss_score",
+    "type": "FLOAT64",
+    "mode": "NULLABLE",
+    "description": "CVSS v3 base score (0.0 - 10.0)"
+  },
+  {
+    "name": "title",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Short title or summary of the vulnerability"
+  },
+  {
+    "name": "description",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Detailed description of the vulnerability"
+  },
+  {
+    "name": "resource_namespace",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Kubernetes namespace of the scanned resource"
+  },
+  {
+    "name": "resource_name",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Name of the scanned Kubernetes resource (e.g., deployment name)"
+  },
+  {
+    "name": "resource_kind",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Kind of Kubernetes resource (e.g., Deployment, DaemonSet, StatefulSet)"
+  },
+  {
+    "name": "image",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Full container image reference including tag or digest"
+  },
+  {
+    "name": "scan_timestamp",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "Timestamp when the Trivy scan was performed"
+  },
+  {
+    "name": "ingestion_timestamp",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "Timestamp when this record was ingested into the vulnerabilities table"
+  },
+  {
+    "name": "primary_link",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Primary URL reference for the vulnerability advisory"
+  },
+  {
+    "name": "target",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Scan target within the image (e.g., OS packages, language-specific files)"
+  },
+  {
+    "name": "pkg_type",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Package type or ecosystem (e.g., debian, alpine, npm, pip)"
+  },
+  {
+    "name": "data_source",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Vulnerability database source (e.g., NVD, GHSA, Red Hat)"
+  }
+]

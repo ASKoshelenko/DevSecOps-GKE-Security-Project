@@ -1,0 +1,134 @@
+[
+  {
+    "name": "timestamp",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "Timestamp when the log entry was created in Cloud Logging"
+  },
+  {
+    "name": "severity",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Log entry severity level (INFO, WARNING, ERROR, etc.)"
+  },
+  {
+    "name": "insert_id",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Unique identifier for the log entry, used for deduplication"
+  },
+  {
+    "name": "log_name",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Full resource name of the log this entry belongs to"
+  },
+  {
+    "name": "resource",
+    "type": "RECORD",
+    "mode": "NULLABLE",
+    "description": "Monitored resource that produced this log entry",
+    "fields": [
+      {
+        "name": "type",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "Resource type identifier (e.g., k8s_container, k8s_cluster)"
+      },
+      {
+        "name": "labels",
+        "type": "RECORD",
+        "mode": "NULLABLE",
+        "description": "Labels describing the monitored resource",
+        "fields": [
+          {
+            "name": "project_id",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "GCP project ID"
+          },
+          {
+            "name": "cluster_name",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "GKE cluster name"
+          },
+          {
+            "name": "namespace_name",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Kubernetes namespace"
+          },
+          {
+            "name": "container_name",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Container name within the pod"
+          },
+          {
+            "name": "pod_name",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Kubernetes pod name"
+          },
+          {
+            "name": "location",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "GCP region or zone of the resource"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "labels",
+    "type": "RECORD",
+    "mode": "NULLABLE",
+    "description": "User-defined labels attached to the log entry",
+    "fields": [
+      {
+        "name": "k8s_pod_app",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "Kubernetes app label from the pod"
+      },
+      {
+        "name": "k8s_pod_controller_kind",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "Kind of the controller managing the pod"
+      },
+      {
+        "name": "k8s_pod_controller_name",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "Name of the controller managing the pod"
+      }
+    ]
+  },
+  {
+    "name": "json_payload",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Raw JSON payload from the Trivy operator log containing the VulnerabilityReport CRD data"
+  },
+  {
+    "name": "receive_timestamp",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE",
+    "description": "Timestamp when the log entry was received by Cloud Logging"
+  },
+  {
+    "name": "trace",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Resource name of the trace associated with the log entry, if any"
+  },
+  {
+    "name": "span_id",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Span ID within the trace associated with the log entry"
+  }
+]

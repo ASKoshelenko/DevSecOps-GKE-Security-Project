@@ -1,0 +1,204 @@
+# =============================================================================
+# Pre-commit Configuration - DevSecOps Project
+# =============================================================================
+#
+# Runs automated checks before each git commit to enforce code quality,
+# security standards, and formatting consistency.
+#
+# SETUP:
+#   pip install pre-commit
+#   pre-commit install
+#
+# MANUAL RUN:
+#   pre-commit run --all-files
+#
+# UPDATE HOOKS:
+#   pre-commit autoupdate
+#
+# =============================================================================
+
+repos:
+  # ---------------------------------------------------------------------------
+  # General: Trailing whitespace, file endings, YAML/JSON syntax
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+        exclude: ^(helm/|k8s-security/)  # Helm templates use Go templating
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: detect-private-key
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: no-commit-to-branch
+        args: [--branch, main, --branch, master]
+
+  # ---------------------------------------------------------------------------
+  # Terraform: Formatting and Linting
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.96.1
+    hooks:
+      # terraform fmt - Enforce canonical formatting
+      - id: terraform_fmt
+        args:
+          - --args=-recursive
+
+      # tflint - Terraform linting with GCP ruleset
+      - id: terraform_tflint
+        args:
+          - --args=--config=__GIT_WORKING_DIR__/.tflint.hcl
+          - --hook-config=--delegate-chdir
+
+      # tfsec - Static security analysis for Terraform
+      - id: terraform_tfsec
+        args:
+          - --args=--soft-fail
+          - --args=--minimum-severity=HIGH
+
+      # terraform validate - Syntax and reference checking
+      - id: terraform_validate
+        args:
+          - --hook-config=--retry-once-with-cleanup=true
+          - --tf-init-args=-backend=false
+
+      # checkov - Policy-as-code scanning
+      - id: terraform_checkov
+        args:
+          - --args=--quiet
+          - --args=--compact
+          - --args=--soft-fail
+
+  # ---------------------------------------------------------------------------
+  # Secret Detection
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args:
+          - --baseline
+          - .secrets.baseline
+        exclude: |
+          (?x)^(
+            .*test.*|
+            .*\.lock$|
+            .*\.sum$|
+            k8s-security/.*  # Intentionally vulnerable configs
+          )$
+
+  # ---------------------------------------------------------------------------
+  # YAML Linting
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.35.1
+    hooks:
+      - id: yamllint
+        args:
+          - -d
+          - "{extends: default, rules: {line-length: {max: 200}, document-start: disable, truthy: {allowed-values: ['true', 'false', 'yes', 'no']}, comments: {min-spaces-from-content: 1}, indentation: {spaces: 2, indent-sequences: whatever}}}"
+        exclude: ^(helm/.*templates/|\.rendered-manifests/)
+
+  # ---------------------------------------------------------------------------
+  # Shell Script Linting
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        args:
+          - -x              # Follow sourced files
+          - -S warning      # Minimum severity: warning
+          - -e SC1091       # Ignore "not following sourced file"
+          - -e SC2086       # Ignore "double quote to prevent globbing"
+
+  # ---------------------------------------------------------------------------
+  # Python: Formatting and Linting
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/psf/black
+    rev: 24.8.0
+    hooks:
+      - id: black
+        args:
+          - --line-length=120
+
+  - repo: https://github.com/PyCQA/flake8
+    rev: 7.1.1
+    hooks:
+      - id: flake8
+        args:
+          - --max-line-length=120
+          - --ignore=E501,W503,E203
+
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args:
+          - --profile=black
+          - --line-length=120
+
+  # ---------------------------------------------------------------------------
+  # Markdown Linting (for docs)
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.42.0
+    hooks:
+      - id: markdownlint
+        args:
+          - --disable
+          - MD013   # Line length
+          - MD033   # Inline HTML
+          - MD041   # First line heading
+          - --
+
+  # ---------------------------------------------------------------------------
+  # Gitleaks - Secret scanning
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.1
+    hooks:
+      - id: gitleaks
+        args:
+          - --redact
+        exclude: |
+          (?x)^(
+            k8s-security/.*|  # Intentionally vulnerable configs
+            .*test.*
+          )$
+
+  # ---------------------------------------------------------------------------
+  # Hadolint - Dockerfile linting (if Dockerfiles are added)
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/hadolint/hadolint
+    rev: v2.12.0
+    hooks:
+      - id: hadolint-docker
+        types: [dockerfile]
+
+# =============================================================================
+# CI Configuration
+# =============================================================================
+# These settings apply to pre-commit CI (https://pre-commit.ci/)
+ci:
+  autofix_commit_msg: "style: auto-fix pre-commit hooks"
+  autofix_prs: true
+  autoupdate_branch: develop
+  autoupdate_commit_msg: "chore: pre-commit autoupdate"
+  autoupdate_schedule: weekly
+  skip:
+    - terraform_validate  # Needs terraform init
+    - terraform_tflint    # Needs tflint plugins
+    - terraform_tfsec     # Needs tfsec binary
+    - terraform_checkov   # Needs checkov binary
+    - hadolint-docker     # Needs docker

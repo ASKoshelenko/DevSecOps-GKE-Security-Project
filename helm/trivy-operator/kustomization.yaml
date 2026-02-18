@@ -1,0 +1,137 @@
+# =============================================================================
+# Kustomization for Trivy Operator
+# =============================================================================
+# This kustomization overlays additional patches on top of the Helm-rendered
+# Trivy Operator manifests. It is used to apply environment-specific
+# customizations that are not easily expressed through Helm values alone.
+#
+# USAGE:
+#   1. Render the Helm chart:
+#      helm template trivy-operator aquasecurity/trivy-operator \
+#        -n trivy-system -f values.yaml > base/trivy-operator.yaml
+#   2. Apply kustomize:
+#      kubectl apply -k .
+#
+# Alternatively, use the install.sh script which handles both steps.
+# =============================================================================
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+metadata:
+  name: trivy-operator-overlay
+
+# -----------------------------------------------------------------------------
+# Namespace
+# -----------------------------------------------------------------------------
+# Force all resources into the trivy-system namespace.
+# This ensures scan jobs and operator components are isolated.
+# -----------------------------------------------------------------------------
+namespace: trivy-system
+
+# -----------------------------------------------------------------------------
+# Common Labels
+# -----------------------------------------------------------------------------
+# Applied to all resources for consistent identification and
+# log filtering in BigQuery/Cloud Logging.
+# -----------------------------------------------------------------------------
+commonLabels:
+  app.kubernetes.io/part-of: devsecops-platform
+  app.kubernetes.io/managed-by: kustomize
+  environment: production
+  team: security
+
+# -----------------------------------------------------------------------------
+# Common Annotations
+# -----------------------------------------------------------------------------
+commonAnnotations:
+  config.kubernetes.io/origin: "helm+kustomize"
+  security.devsecops.io/component: "vulnerability-scanner"
+
+# -----------------------------------------------------------------------------
+# Patches
+# -----------------------------------------------------------------------------
+# Strategic merge patches for GKE-specific configurations that
+# complement the Helm values.
+# -----------------------------------------------------------------------------
+patches:
+  # -- Patch: Add GKE-specific pod annotations to the operator Deployment
+  # Ensures proper interaction with GKE's managed components
+  - target:
+      kind: Deployment
+      name: trivy-operator
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: trivy-operator
+      spec:
+        template:
+          metadata:
+            annotations:
+              # Exclude from GKE managed Istio/ASM sidecar injection
+              sidecar.istio.io/inject: "false"
+              # Enable Workload Identity metadata server access
+              gke-metadata-server.enabled: "true"
+          spec:
+            # Ensure the operator runs on linux/amd64 nodes
+            nodeSelector:
+              kubernetes.io/os: linux
+              kubernetes.io/arch: amd64
+            # Spread operator pods across zones for resilience
+            topologySpreadConstraints:
+              - maxSkew: 1
+                topologyKey: topology.kubernetes.io/zone
+                whenUnsatisfiable: ScheduleAnyway
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: trivy-operator
+
+  # -- Patch: Add resource quotas for the trivy-system namespace
+  - patch: |-
+      apiVersion: v1
+      kind: ResourceQuota
+      metadata:
+        name: trivy-system-quota
+        namespace: trivy-system
+      spec:
+        hard:
+          # Limit total scan jobs to prevent resource exhaustion
+          count/jobs.batch: "20"
+          # Limit total CPU and memory for all scan jobs
+          requests.cpu: "4"
+          requests.memory: 8Gi
+          limits.cpu: "8"
+          limits.memory: 16Gi
+
+  # -- Patch: NetworkPolicy to restrict operator egress
+  - patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: trivy-operator-egress
+        namespace: trivy-system
+      spec:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: trivy-operator
+        policyTypes:
+          - Egress
+        egress:
+          # Allow DNS resolution
+          - to: []
+            ports:
+              - protocol: UDP
+                port: 53
+              - protocol: TCP
+                port: 53
+          # Allow HTTPS to Kubernetes API and container registries
+          - to: []
+            ports:
+              - protocol: TCP
+                port: 443
+          # Allow HTTP (for some registries that redirect)
+          - to: []
+            ports:
+              - protocol: TCP
+                port: 80

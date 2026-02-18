@@ -1,0 +1,170 @@
+# =============================================================================
+# Privileged Pod Specification - INTENTIONALLY INSECURE
+# =============================================================================
+#
+# PURPOSE: This pod spec creates a container with maximum privileges,
+# demonstrating how misconfigured pods enable container escape.
+#
+# SECURITY VIOLATIONS (each one is dangerous on its own):
+#   1. privileged: true          - Disables all container isolation
+#   2. hostPID: true             - Shares host's PID namespace
+#   3. hostNetwork: true         - Shares host's network namespace
+#   4. hostIPC: true             - Shares host's IPC namespace
+#   5. hostPath mounts           - Direct access to host filesystem
+#   6. ALL capabilities          - Every Linux capability granted
+#   7. runAsUser: 0              - Running as root
+#   8. allowPrivilegeEscalation  - Allows gaining additional privileges
+#   9. No seccomp profile        - No syscall filtering
+#  10. No AppArmor profile       - No mandatory access control
+#  11. Docker socket mount       - Full control over container runtime
+#
+# WARNING: Deploy ONLY in authorized testing environments.
+#
+# =============================================================================
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: escape-pod
+  namespace: insecure-ns
+  labels:
+    app: escape-demo
+    purpose: security-testing
+  annotations:
+    # VULNERABLE: Explicitly disable AppArmor
+    container.apparmor.security.beta.kubernetes.io/escape-container: unconfined
+spec:
+  # ---- VULNERABLE: Share host namespaces ----
+  # hostPID allows seeing and signaling ALL host processes
+  hostPID: true
+  # hostNetwork allows binding to host ports and sniffing host traffic
+  hostNetwork: true
+  # hostIPC allows accessing host shared memory segments
+  hostIPC: true
+
+  # Use the overprivileged service account created during cluster setup
+  serviceAccountName: attack-sa
+  automountServiceAccountToken: true
+
+  # Don't restart - this is a demo pod
+  restartPolicy: Never
+
+  containers:
+    - name: escape-container
+      # Use our custom image with exploit tools, or fallback to ubuntu
+      image: ubuntu:22.04
+      # Keep container running for interactive access
+      command: ["sleep", "infinity"]
+
+      # ---- VULNERABLE: Full privileges ----
+      securityContext:
+        # VULNERABLE: Disables ALL container security mechanisms
+        # - All capabilities granted
+        # - No seccomp filtering
+        # - No AppArmor restrictions
+        # - Device access unrestricted
+        # - /proc and /sys mounted read-write
+        privileged: true
+
+        # VULNERABLE: Run as root
+        runAsUser: 0
+        runAsGroup: 0
+
+        # VULNERABLE: Allow gaining additional privileges via setuid binaries
+        allowPrivilegeEscalation: true
+
+        # VULNERABLE: Grant ALL Linux capabilities explicitly
+        # (redundant with privileged:true but shown for documentation)
+        capabilities:
+          add:
+            - SYS_ADMIN        # Mount filesystems, change namespaces
+            - SYS_PTRACE       # Trace/debug any process
+            - SYS_RAWIO        # Raw I/O port access
+            - SYS_MODULE       # Load/unload kernel modules
+            - SYS_BOOT         # Reboot the system
+            - NET_ADMIN        # Network configuration
+            - NET_RAW           # Raw sockets (packet sniffing)
+            - DAC_OVERRIDE     # Bypass file permission checks
+            - DAC_READ_SEARCH  # Bypass file read permission checks
+            - FOWNER           # Bypass ownership checks
+            - KILL             # Send signals to any process
+            - SETUID           # Change UID
+            - SETGID           # Change GID
+            - MKNOD            # Create device files
+            - AUDIT_WRITE      # Write to audit log
+            - SETFCAP          # Set file capabilities
+            - SYS_CHROOT       # Use chroot
+            - SYS_RESOURCE     # Override resource limits
+
+        # VULNERABLE: Disable seccomp entirely
+        seccompProfile:
+          type: Unconfined
+
+      # ---- VULNERABLE: Host filesystem mounts ----
+      volumeMounts:
+        # Mount the entire host root filesystem
+        - name: host-root
+          mountPath: /host
+          readOnly: false
+
+        # Mount Docker socket for container runtime access
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+          readOnly: false
+
+        # Mount host's /etc for credential access
+        - name: host-etc
+          mountPath: /host-etc
+          readOnly: false
+
+        # Mount kubelet directory for K8s credential access
+        - name: kubelet
+          mountPath: /var/lib/kubelet
+          readOnly: false
+
+        # Mount host's /proc for process namespace access
+        - name: host-proc
+          mountPath: /host-proc
+          readOnly: false
+
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "1Gi"
+          cpu: "1"
+
+  # ---- Volume definitions ----
+  volumes:
+    - name: host-root
+      hostPath:
+        path: /
+        type: Directory
+
+    - name: docker-sock
+      hostPath:
+        path: /var/run/docker.sock
+        type: Socket
+
+    - name: host-etc
+      hostPath:
+        path: /etc
+        type: Directory
+
+    - name: kubelet
+      hostPath:
+        path: /var/lib/kubelet
+        type: DirectoryOrCreate
+
+    - name: host-proc
+      hostPath:
+        path: /proc
+        type: Directory
+
+  # Schedule on any node (no tolerations needed for kind)
+  tolerations:
+    - operator: "Exists"
+      effect: "NoSchedule"
+    - operator: "Exists"
+      effect: "NoExecute"

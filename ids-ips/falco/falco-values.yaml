@@ -1,0 +1,327 @@
+# =============================================================================
+# Falco Helm Values - GKE Production Deployment
+# =============================================================================
+#
+# Helm chart: falcosecurity/falco (v4.x)
+# Repository: https://falcosecurity.github.io/charts
+#
+# This configuration deploys Falco as a DaemonSet on GKE with:
+#   - eBPF probe (compatible with GKE Container-Optimized OS)
+#   - Custom rules for Russian APT detection
+#   - gRPC output for log forwarding to ELK
+#   - Integration with GCP Cloud Logging via Falcosidekick
+#   - Kernel-level syscall monitoring with low overhead (<3% CPU)
+#
+# Installation:
+#   helm repo add falcosecurity https://falcosecurity.github.io/charts
+#   helm repo update
+#   helm install falco falcosecurity/falco \
+#     --namespace falco-system --create-namespace \
+#     -f falco-values.yaml
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Image Configuration
+# -----------------------------------------------------------------------------
+image:
+  registry: docker.io
+  repository: falcosecurity/falco-no-driver
+  tag: "0.38.1"
+  pullPolicy: IfNotPresent
+
+# -----------------------------------------------------------------------------
+# Driver Configuration
+# -----------------------------------------------------------------------------
+# GKE uses Container-Optimized OS (COS) which does not support loading
+# kernel modules. We use the modern eBPF probe instead, which works with
+# COS and provides the same syscall visibility with better performance.
+# -----------------------------------------------------------------------------
+driver:
+  enabled: true
+  kind: modern_ebpf
+  # modern_ebpf does not require kernel headers or a build step.
+  # It uses CO-RE (Compile Once, Run Everywhere) BTF-based eBPF programs.
+  modernEbpf:
+    leastPrivileged: true
+
+# -----------------------------------------------------------------------------
+# Falco Engine Configuration
+# -----------------------------------------------------------------------------
+falco:
+  # JSON output is required for structured log parsing by Filebeat/Logstash
+  jsonOutput: true
+  jsonIncludeOutputProperty: true
+  jsonIncludeTagsProperty: true
+
+  # Log level for Falco itself (not the rules)
+  logLevel: info
+  logStderr: true
+  logSyslog: false
+
+  # Enable all output channels
+  stdoutOutput:
+    enabled: true
+    # Rate limiting prevents log flooding from noisy rules
+    rateLimit: 0
+
+  fileOutput:
+    enabled: true
+    filename: /var/log/falco/events.json
+    keepAlive: true
+
+  # gRPC server for streaming events to external consumers
+  # (Falcosidekick, custom integrations, ELK stack)
+  grpc:
+    enabled: true
+    # Unix socket for local Falcosidekick sidecar
+    unixSocketPath: "unix:///run/falco/falco.sock"
+    threadiness: 4
+
+  grpcOutput:
+    enabled: true
+
+  # HTTP output to Falcosidekick for alert forwarding
+  httpOutput:
+    enabled: true
+    url: "http://falcosidekick:2801"
+    userAgent: "falco/gke-apt-detection"
+
+  # Metrics server for Prometheus scraping
+  metricsEnabled: true
+  metricsInterval: 30
+  metricsOutputRule: true
+
+  # Buffer sizing for high-throughput environments
+  syscallBufSizePreset: 4
+  # Drop alerts rather than blocking the kernel if buffer is full
+  syscallDropFailedExit: false
+
+  # Rule loading priority: custom rules override default rules
+  rulesFiles:
+    - /etc/falco/falco_rules.yaml
+    - /etc/falco/falco_rules.local.yaml
+    - /etc/falco/rules.d
+
+  # Append custom rules via configmap
+  rules:
+    - /etc/falco/rules.d/custom-rules.yaml
+
+# -----------------------------------------------------------------------------
+# Custom Rules ConfigMap
+# -----------------------------------------------------------------------------
+# Mount our APT detection rules into Falco's rules directory.
+# The custom-rules.yaml file is loaded from a ConfigMap.
+# -----------------------------------------------------------------------------
+customRules:
+  custom-rules.yaml: |-
+    # This is loaded from the custom-rules.yaml file via Helm values.
+    # In production, use a separate ConfigMap for easier rule management.
+    # See: custom-rules.yaml in this directory.
+
+# -----------------------------------------------------------------------------
+# Falcosidekick - Alert Forwarding
+# -----------------------------------------------------------------------------
+# Falcosidekick receives alerts from Falco and forwards them to multiple
+# destinations: GCP Cloud Logging, Slack, PagerDuty, Elasticsearch, etc.
+# -----------------------------------------------------------------------------
+falcosidekick:
+  enabled: true
+  replicaCount: 2
+
+  config:
+    # -- GCP Cloud Logging integration --
+    # Forwards all Falco alerts to Cloud Logging for centralized visibility.
+    # Alerts appear in the GCP Console under Logging with the specified log ID.
+    gcp:
+      credentials: ""  # Uses Workload Identity (no key file needed)
+      cloudLogging:
+        enabled: true
+        logId: "falco-security-alerts"
+        # Only forward WARNING and above to Cloud Logging to reduce noise
+        minimumPriority: "warning"
+
+    # -- Elasticsearch integration --
+    # Direct forwarding to the ELK stack for SIEM correlation.
+    elasticsearch:
+      hostPort: "http://elasticsearch-master:9200"
+      index: "falco-alerts"
+      type: "_doc"
+      minimumPriority: "notice"
+      # Mutualauth for production:
+      # mutualtls: true
+      # checkcert: true
+
+    # -- Slack notifications for critical alerts --
+    slack:
+      webhookurl: ""  # Set via --set falcosidekick.config.slack.webhookurl=<URL>
+      channel: "#security-alerts"
+      username: "Falco APT Detection"
+      icon: ":shield:"
+      minimumPriority: "critical"
+      messageFormat: |
+        *Priority:* {{ .Priority }}
+        *Rule:* {{ .Rule }}
+        *Output:* {{ .Output }}
+        *Tags:* {{ range .Tags }}{{ . }} {{ end }}
+        *Time:* {{ .Time }}
+
+    # -- PagerDuty for emergency alerts --
+    pagerduty:
+      routingKey: ""  # Set via --set falcosidekick.config.pagerduty.routingKey=<KEY>
+      minimumPriority: "emergency"
+      region: "us"
+
+    # -- Custom webhook for auto-response --
+    webhook:
+      address: "http://incident-responder:8080/falco-alert"
+      minimumPriority: "critical"
+
+  # Falcosidekick resource limits
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+  # Falcosidekick UI for visual alert management
+  webui:
+    enabled: true
+    replicaCount: 1
+    service:
+      type: ClusterIP
+      port: 2802
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+
+# -----------------------------------------------------------------------------
+# DaemonSet Configuration
+# -----------------------------------------------------------------------------
+# Falco runs as a DaemonSet so every GKE node is monitored.
+# Tolerations ensure Falco runs on all nodes including tainted ones.
+# -----------------------------------------------------------------------------
+controller:
+  kind: daemonset
+  daemonset:
+    updateStrategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 1
+
+# Tolerations to ensure Falco runs on ALL nodes, including:
+# - GKE system nodes (COS-based)
+# - GPU nodes
+# - Preemptible/spot nodes
+tolerations:
+  - effect: NoSchedule
+    operator: Exists
+  - effect: NoExecute
+    operator: Exists
+
+# Node selector - empty to run on all nodes
+nodeSelector: {}
+
+# Priority class ensures Falco is not evicted under resource pressure
+priorityClassName: system-node-critical
+
+# -----------------------------------------------------------------------------
+# Resource Limits
+# -----------------------------------------------------------------------------
+# Falco with eBPF probe typically uses ~100-200m CPU and ~256-512Mi memory.
+# These limits allow headroom for burst activity during incident detection.
+# -----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# -----------------------------------------------------------------------------
+# Security Context
+# -----------------------------------------------------------------------------
+# Falco requires privileged access to read syscalls via eBPF.
+# This is the minimum required privilege for kernel-level monitoring.
+# -----------------------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: false
+
+containerSecurityContext:
+  privileged: true
+  # Required for eBPF program loading
+  capabilities:
+    add:
+      - BPF
+      - SYS_PTRACE
+      - SYS_RESOURCE
+
+# -----------------------------------------------------------------------------
+# Service Account & RBAC
+# -----------------------------------------------------------------------------
+# Falco needs read access to Kubernetes metadata (pod names, namespaces,
+# labels) to enrich alerts with K8s context.
+# -----------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: falco
+  annotations:
+    # Workload Identity annotation for GCP integration
+    # Replace with actual GCP SA email
+    iam.gke.io/gcp-service-account: "falco-logging@PROJECT_ID.iam.gserviceaccount.com"
+
+rbac:
+  create: true
+
+# -----------------------------------------------------------------------------
+# Volumes
+# -----------------------------------------------------------------------------
+# Mount host paths required for eBPF probe and log output.
+# -----------------------------------------------------------------------------
+extraVolumes:
+  - name: falco-logs
+    hostPath:
+      path: /var/log/falco
+      type: DirectoryOrCreate
+
+extraVolumeMounts:
+  - name: falco-logs
+    mountPath: /var/log/falco
+
+# -----------------------------------------------------------------------------
+# Pod Labels and Annotations
+# -----------------------------------------------------------------------------
+podLabels:
+  app.kubernetes.io/part-of: ids-ips
+  security.devsecops/component: runtime-detection
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8765"
+  prometheus.io/path: "/metrics"
+
+# -----------------------------------------------------------------------------
+# Collectors Configuration
+# -----------------------------------------------------------------------------
+# Enable Kubernetes metadata enrichment for better alert context.
+# This adds pod name, namespace, deployment, and labels to every alert.
+# -----------------------------------------------------------------------------
+collectors:
+  kubernetes:
+    enabled: true
+    # Collect metadata for all pods
+    nodeFilter: ""
+    # Watch for changes in real-time
+    watchPods: true
+    # Cache metadata for performance
+    cacheSize: 1000
+  containerd:
+    enabled: true
+    socket: /run/containerd/containerd.sock

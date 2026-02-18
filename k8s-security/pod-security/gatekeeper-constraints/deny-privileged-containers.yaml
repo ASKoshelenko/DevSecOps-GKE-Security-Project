@@ -1,0 +1,114 @@
+# =============================================================================
+# OPA Gatekeeper Constraint: Deny Privileged Containers
+# =============================================================================
+#
+# PURPOSE: Prevents the creation of pods with privileged containers.
+# Privileged containers disable all container security isolation,
+# making container escape trivial.
+#
+# WHAT IT BLOCKS:
+#   - securityContext.privileged: true
+#   - Any container (init or regular) with privileged flag
+#
+# PREREQUISITES:
+#   - OPA Gatekeeper installed in the cluster
+#     kubectl apply -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/release-3.14/deploy/gatekeeper.yaml
+#
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# ConstraintTemplate: Define the Rego policy
+# ---------------------------------------------------------------------------
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sdenyprivilegedcontainers
+  annotations:
+    description: "Denies pods that use privileged containers"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sDenyPrivilegedContainers
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            exemptImages:
+              type: array
+              description: "List of image patterns exempt from this policy"
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sdenyprivilegedcontainers
+
+        # Violation for regular containers
+        violation[{"msg": msg}] {
+            container := input.review.object.spec.containers[_]
+            container.securityContext.privileged == true
+            not is_exempt(container.image)
+            msg := sprintf(
+                "DENIED: Container '%s' in pod '%s' is privileged. "  +
+                "Privileged containers disable all security isolation. " +
+                "Remove 'privileged: true' from the container's securityContext.",
+                [container.name, input.review.object.metadata.name]
+            )
+        }
+
+        # Violation for init containers
+        violation[{"msg": msg}] {
+            container := input.review.object.spec.initContainers[_]
+            container.securityContext.privileged == true
+            not is_exempt(container.image)
+            msg := sprintf(
+                "DENIED: Init container '%s' in pod '%s' is privileged. " +
+                "Remove 'privileged: true' from the init container's securityContext.",
+                [container.name, input.review.object.metadata.name]
+            )
+        }
+
+        # Violation for ephemeral containers
+        violation[{"msg": msg}] {
+            container := input.review.object.spec.ephemeralContainers[_]
+            container.securityContext.privileged == true
+            not is_exempt(container.image)
+            msg := sprintf(
+                "DENIED: Ephemeral container '%s' in pod '%s' is privileged.",
+                [container.name, input.review.object.metadata.name]
+            )
+        }
+
+        # Check if image is in the exempt list
+        is_exempt(image) {
+            exempt_image := input.parameters.exemptImages[_]
+            glob.match(exempt_image, ["/"], image)
+        }
+
+---
+# ---------------------------------------------------------------------------
+# Constraint: Apply the policy cluster-wide
+# ---------------------------------------------------------------------------
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sDenyPrivilegedContainers
+metadata:
+  name: deny-privileged-containers
+  annotations:
+    description: "Deny all privileged containers across the cluster"
+spec:
+  enforcementAction: deny  # Options: deny, dryrun, warn
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    # Exclude system namespaces that may need privileged containers
+    excludedNamespaces:
+      - kube-system
+      - gatekeeper-system
+  parameters:
+    exemptImages:
+      # Add any images that legitimately need privileged access
+      # (should be extremely rare)
+      # - "registry.example.com/csi-driver:*"
+      []

@@ -1,0 +1,231 @@
+# =============================================================================
+# Suricata IDS Custom Rules - Russian APT Network Detection
+# =============================================================================
+#
+# These rules detect network-level indicators of compromise (IOCs) associated
+# with Russian APT activity in GKE/GCP environments. Rules complement Falco's
+# runtime detection by providing network traffic analysis.
+#
+# Rule SID ranges:
+#   1000001-1000099: C2 callback detection
+#   1000100-1000199: Crypto mining detection
+#   1000200-1000299: DNS-based detection
+#   1000300-1000399: Data exfiltration detection
+#   1000400-1000499: TOR and anonymization detection
+#   1000500-1000599: Protocol anomaly detection
+#
+# All rules use the "apt" classtype for unified alerting.
+# Priority 1 = highest (emergency), Priority 4 = lowest (informational)
+#
+# =============================================================================
+
+
+# =============================================================================
+# C2 CALLBACK DETECTION
+# =============================================================================
+# Detect outbound connections to common C2 framework ports and patterns.
+# Russian APTs commonly use Metasploit (4444), Cobalt Strike (8443),
+# and custom RATs (5555) for post-exploitation C2.
+# =============================================================================
+
+# -- Metasploit Meterpreter default reverse TCP handler (port 4444) --
+# Metasploit is the most commonly used exploitation framework.
+# Port 4444 is the default handler port for reverse TCP payloads.
+alert tcp $HOME_NET any -> $EXTERNAL_NET 4444 (msg:"APT C2 - Outbound connection to Metasploit default port 4444"; flow:to_server,established; classtype:trojan-activity; sid:1000001; rev:3; priority:1; metadata:mitre_attack T1071, deployment gke, threat_actor russian_apt;)
+
+# -- Custom RAT backconnect on port 5555 --
+# Port 5555 is used by multiple RAT families and custom backdoors.
+# Also used by Android ADB but should never be seen from GKE pods.
+alert tcp $HOME_NET any -> $EXTERNAL_NET 5555 (msg:"APT C2 - Outbound connection to common RAT port 5555"; flow:to_server,established; classtype:trojan-activity; sid:1000002; rev:3; priority:1; metadata:mitre_attack T1071, deployment gke, threat_actor russian_apt;)
+
+# -- Cobalt Strike default HTTPS C2 on port 8443 --
+# Cobalt Strike uses 8443 as its default HTTPS listener port.
+# This is distinct from legitimate 8443 traffic by the flow pattern.
+alert tcp $HOME_NET any -> $EXTERNAL_NET 8443 (msg:"APT C2 - Outbound connection to Cobalt Strike default port 8443"; flow:to_server,established; classtype:trojan-activity; sid:1000003; rev:3; priority:1; metadata:mitre_attack T1071, deployment gke, threat_actor russian_apt;)
+
+# -- TOR/Custom C2 on port 9001 --
+# Port 9001 is used by TOR ORPort and some custom C2 frameworks.
+alert tcp $HOME_NET any -> $EXTERNAL_NET 9001 (msg:"APT C2 - Outbound connection to TOR/C2 port 9001"; flow:to_server,established; classtype:trojan-activity; sid:1000004; rev:2; priority:1; metadata:mitre_attack T1071, deployment gke;)
+
+# -- IRC-based C2 channels (ports 6666-6667) --
+# Legacy but still used by some botnets and APTs for C2 communication.
+alert tcp $HOME_NET any -> $EXTERNAL_NET [6666,6667] (msg:"APT C2 - Outbound IRC connection (potential botnet C2)"; flow:to_server,established; classtype:trojan-activity; sid:1000005; rev:2; priority:2; metadata:mitre_attack T1071, deployment gke;)
+
+# -- Elite/BackOrifice ports (1337, 31337) --
+# Classic backdoor ports, still used by some modern malware.
+alert tcp $HOME_NET any -> $EXTERNAL_NET [1337,31337] (msg:"APT C2 - Outbound connection to classic backdoor port"; flow:to_server,established; classtype:trojan-activity; sid:1000006; rev:2; priority:2; metadata:mitre_attack T1071, deployment gke;)
+
+# -- Cobalt Strike beacon HTTP indicators --
+# Detect Cobalt Strike beacon check-in patterns in HTTP traffic.
+# The default profile uses specific URI patterns and cookie formats.
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"APT C2 - Cobalt Strike beacon HTTP check-in pattern"; flow:to_server,established; content:"GET"; http_method; pcre:"/^\/[a-zA-Z0-9]{4}\.(js|css|html|png|gif|jpg)/U"; content:"Cookie|3a|"; http_header; pcre:"/Cookie\x3a\s[a-zA-Z]+=(?:[A-Za-z0-9+\/]{4})*(?:[A-Za-z0-9+\/]{2}==|[A-Za-z0-9+\/]{3}=)?/H"; classtype:trojan-activity; sid:1000010; rev:2; priority:1; metadata:mitre_attack T1071.001, deployment gke, threat_actor russian_apt;)
+
+# -- Meterpreter HTTPS stager --
+# Detect Meterpreter HTTPS stager with characteristic TLS patterns.
+alert tls $HOME_NET any -> $EXTERNAL_NET any (msg:"APT C2 - Possible Meterpreter HTTPS stager (self-signed cert)"; flow:to_server,established; tls.cert_subject; content:"CN=localhost"; classtype:trojan-activity; sid:1000011; rev:2; priority:2; metadata:mitre_attack T1573.002, deployment gke;)
+
+# -- Reverse shell over common web ports --
+# Detect shell commands in HTTP POST body (web shell activity).
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"APT C2 - Possible web shell command execution in HTTP POST"; flow:to_server,established; content:"POST"; http_method; content:"cmd="; http_client_body; pcre:"/cmd=(whoami|id|uname|cat\s+\/etc|ls\s+|pwd|wget|curl)/P"; classtype:trojan-activity; sid:1000012; rev:2; priority:1; metadata:mitre_attack T1059.004, deployment gke;)
+
+# -- Generic long-lived TCP connection to non-standard port --
+# C2 channels typically maintain persistent connections.
+alert tcp $HOME_NET any -> $EXTERNAL_NET [2222,3333,7777,9999,12345,65535] (msg:"APT C2 - Outbound connection to suspicious non-standard port"; flow:to_server,established; classtype:trojan-activity; sid:1000013; rev:2; priority:2; metadata:mitre_attack T1571, deployment gke;)
+
+
+# =============================================================================
+# CRYPTO MINING DETECTION
+# =============================================================================
+# Detect cryptocurrency mining pool connections using the Stratum protocol
+# and known mining pool domains. Crypto mining is a common secondary
+# objective for APT groups after gaining cluster access.
+# =============================================================================
+
+# -- Stratum mining protocol over TCP --
+# The Stratum protocol uses JSON-RPC with specific method names.
+# "mining.subscribe" is the first message sent by a miner to a pool.
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"CRYPTO MINING - Stratum mining.subscribe detected"; flow:to_server,established; content:"|22|mining.subscribe|22|"; nocase; classtype:trojan-activity; sid:1000100; rev:3; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+# -- Stratum mining.authorize (worker authentication) --
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"CRYPTO MINING - Stratum mining.authorize detected"; flow:to_server,established; content:"|22|mining.authorize|22|"; nocase; classtype:trojan-activity; sid:1000101; rev:3; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+# -- Stratum mining.submit (share submission) --
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"CRYPTO MINING - Stratum mining.submit detected (active mining)"; flow:to_server,established; content:"|22|mining.submit|22|"; nocase; classtype:trojan-activity; sid:1000102; rev:3; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+# -- Stratum V2 protocol detection --
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"CRYPTO MINING - Stratum V2 protocol detected"; flow:to_server,established; content:"mining.configure"; nocase; classtype:trojan-activity; sid:1000103; rev:1; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+# -- XMRig JSON-RPC login pattern --
+# XMRig uses a specific login JSON-RPC call with "method":"login"
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"CRYPTO MINING - XMRig JSON-RPC login pattern"; flow:to_server,established; content:"|22|method|22|"; content:"|22|login|22|"; distance:0; within:30; content:"|22|agent|22|"; distance:0; within:100; classtype:trojan-activity; sid:1000104; rev:2; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+# -- Common mining pool ports --
+# Mining pools commonly use ports 3333, 5555, 7777, 9999, 14444, 45560
+alert tcp $HOME_NET any -> $EXTERNAL_NET [3333,14433,14444,45560,13333] (msg:"CRYPTO MINING - Connection to common mining pool port"; flow:to_server,established; classtype:trojan-activity; sid:1000105; rev:2; priority:2; metadata:mitre_attack T1496, deployment gke;)
+
+# -- Stratum+TCP URI in cleartext traffic --
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"CRYPTO MINING - Stratum protocol URI detected in traffic"; flow:to_server,established; content:"stratum+tcp://"; nocase; classtype:trojan-activity; sid:1000106; rev:2; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+# -- Stratum+SSL URI in cleartext initiation --
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"CRYPTO MINING - Stratum+SSL protocol URI detected"; flow:to_server,established; content:"stratum+ssl://"; nocase; classtype:trojan-activity; sid:1000107; rev:1; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+
+# =============================================================================
+# DNS-BASED DETECTION
+# =============================================================================
+# Detect DNS queries to known crypto mining pools, suspicious TLDs,
+# and potential DNS tunneling activity.
+# =============================================================================
+
+# -- DNS queries to known Monero mining pools --
+alert dns $HOME_NET any -> any any (msg:"CRYPTO MINING DNS - Query for known Monero mining pool"; dns.query; content:"pool.minexmr.com"; nocase; classtype:trojan-activity; sid:1000200; rev:2; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+alert dns $HOME_NET any -> any any (msg:"CRYPTO MINING DNS - Query for supportxmr pool"; dns.query; content:"supportxmr.com"; nocase; classtype:trojan-activity; sid:1000201; rev:2; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+alert dns $HOME_NET any -> any any (msg:"CRYPTO MINING DNS - Query for hashvault pool"; dns.query; content:"hashvault.pro"; nocase; classtype:trojan-activity; sid:1000202; rev:2; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+alert dns $HOME_NET any -> any any (msg:"CRYPTO MINING DNS - Query for nanopool"; dns.query; content:"nanopool.org"; nocase; classtype:trojan-activity; sid:1000203; rev:2; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+alert dns $HOME_NET any -> any any (msg:"CRYPTO MINING DNS - Query for nicehash pool"; dns.query; content:"nicehash.com"; nocase; classtype:trojan-activity; sid:1000204; rev:1; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+alert dns $HOME_NET any -> any any (msg:"CRYPTO MINING DNS - Query for minergate pool"; dns.query; content:"minergate.com"; nocase; classtype:trojan-activity; sid:1000205; rev:1; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+alert dns $HOME_NET any -> any any (msg:"CRYPTO MINING DNS - Query for f2pool"; dns.query; content:"f2pool.com"; nocase; classtype:trojan-activity; sid:1000206; rev:1; priority:1; metadata:mitre_attack T1496, deployment gke;)
+
+alert dns $HOME_NET any -> any any (msg:"CRYPTO MINING DNS - Query for generic mining pool pattern"; dns.query; pcre:"/\.(pool|mine|miner|mining|hash|coin)\./i"; classtype:trojan-activity; sid:1000210; rev:2; priority:2; metadata:mitre_attack T1496, deployment gke;)
+
+# -- DNS queries to .onion resolvers (TOR hidden services) --
+# APT groups use TOR for anonymized C2 infrastructure.
+alert dns $HOME_NET any -> any any (msg:"APT DNS - Query for TOR hidden service resolver"; dns.query; content:".onion."; nocase; classtype:trojan-activity; sid:1000220; rev:2; priority:1; metadata:mitre_attack T1090.003, deployment gke, threat_actor russian_apt;)
+
+# -- DNS tunneling indicators --
+# Unusually long DNS queries may indicate DNS tunneling for data exfiltration.
+# Legitimate DNS queries rarely exceed 50 characters in the query name.
+alert dns $HOME_NET any -> any any (msg:"APT DNS - Possible DNS tunneling (long query name)"; dns.query; pcre:"/^[a-zA-Z0-9\-\.]{60,}/"; classtype:trojan-activity; sid:1000221; rev:2; priority:2; metadata:mitre_attack T1071.004, deployment gke;)
+
+# -- DNS queries to known DGA TLDs --
+# Domain Generation Algorithms produce domains under specific TLDs.
+alert dns $HOME_NET any -> any any (msg:"APT DNS - Query to suspicious TLD (potential DGA)"; dns.query; pcre:"/\.(xyz|top|club|work|date|bid|stream|download|racing|win|gdn|review|accountant|loan|men|click|link)\./i"; classtype:trojan-activity; sid:1000222; rev:2; priority:3; metadata:mitre_attack T1568.002, deployment gke;)
+
+# -- High-volume TXT record queries (DNS exfiltration) --
+alert dns $HOME_NET any -> any any (msg:"APT DNS - TXT record query (potential data exfiltration)"; dns.query; content:"|00 10|"; classtype:trojan-activity; sid:1000223; rev:1; priority:3; metadata:mitre_attack T1048.003, deployment gke;)
+
+
+# =============================================================================
+# DATA EXFILTRATION DETECTION
+# =============================================================================
+# Detect patterns indicating data exfiltration such as large outbound
+# transfers, connections to cloud storage services from pods, and
+# unusual HTTP upload patterns.
+# =============================================================================
+
+# -- Large outbound HTTP POST (potential data exfiltration) --
+# Normal API calls rarely exceed 10MB in the POST body. Large uploads
+# from GKE pods to external destinations are suspicious.
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"EXFIL - Large HTTP POST (>10MB potential data exfiltration)"; flow:to_server,established; content:"POST"; http_method; http_content_len; content:"Content-Length|3a|"; pcre:"/Content-Length\x3a\s*[1-9]\d{7,}/H"; classtype:trojan-activity; sid:1000300; rev:2; priority:2; metadata:mitre_attack T1048.003, deployment gke;)
+
+# -- Outbound connection to file sharing services --
+# APT groups use legitimate file sharing services for exfiltration.
+alert dns $HOME_NET any -> any any (msg:"EXFIL DNS - Query for file sharing service (potential exfiltration)"; dns.query; pcre:"/(transfer\.sh|file\.io|anonfiles\.com|mega\.nz|dropmefiles\.com|sendspace\.com|wetransfer\.com|gofile\.io)/i"; classtype:trojan-activity; sid:1000301; rev:2; priority:2; metadata:mitre_attack T1567, deployment gke;)
+
+# -- Outbound FTP connection from container --
+# FTP from GKE pods is almost always illegitimate.
+alert tcp $HOME_NET any -> $EXTERNAL_NET [20,21] (msg:"EXFIL - Outbound FTP connection from container network"; flow:to_server,established; classtype:trojan-activity; sid:1000302; rev:2; priority:2; metadata:mitre_attack T1048, deployment gke;)
+
+# -- Base64-encoded data in HTTP headers --
+# APTs sometimes encode exfiltrated data in HTTP headers.
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"EXFIL - Suspicious base64 data in HTTP Cookie header"; flow:to_server,established; content:"Cookie|3a|"; http_header; pcre:"/Cookie\x3a\s*[A-Za-z0-9+\/=]{200,}/H"; classtype:trojan-activity; sid:1000303; rev:1; priority:3; metadata:mitre_attack T1132, deployment gke;)
+
+# -- Outbound SSH to external hosts --
+# SSH from GKE pods to external hosts may indicate tunneling or exfiltration.
+alert tcp $HOME_NET any -> $EXTERNAL_NET 22 (msg:"EXFIL - Outbound SSH connection from container network"; flow:to_server,established; content:"SSH-"; classtype:trojan-activity; sid:1000304; rev:2; priority:2; metadata:mitre_attack T1048, deployment gke;)
+
+
+# =============================================================================
+# TOR AND ANONYMIZATION DETECTION
+# =============================================================================
+# Detect connections to TOR network infrastructure. TOR is commonly used
+# by APT groups to anonymize C2 traffic and exfiltration.
+# =============================================================================
+
+# -- TOR directory authority connection --
+# TOR clients contact directory authorities on specific ports during bootstrap.
+alert tcp $HOME_NET any -> $EXTERNAL_NET 9030 (msg:"TOR - Connection to TOR directory authority port"; flow:to_server,established; classtype:trojan-activity; sid:1000400; rev:2; priority:2; metadata:mitre_attack T1090.003, deployment gke;)
+
+# -- TOR relay/bridge connection on default port --
+alert tcp $HOME_NET any -> $EXTERNAL_NET [9001,9050,9150] (msg:"TOR - Connection to TOR relay/SOCKS port"; flow:to_server,established; classtype:trojan-activity; sid:1000401; rev:2; priority:2; metadata:mitre_attack T1090.003, deployment gke;)
+
+# -- TOR TLS certificate pattern --
+# TOR uses specific certificate patterns that can be fingerprinted.
+alert tls $HOME_NET any -> $EXTERNAL_NET any (msg:"TOR - TOR-like TLS certificate detected"; flow:to_server,established; tls.cert_subject; content:"www."; pcre:"/www\.[a-z0-9]{8,16}\.(net|com|org)/"; tls.cert_issuer; content:"www."; classtype:trojan-activity; sid:1000402; rev:1; priority:2; metadata:mitre_attack T1090.003, deployment gke;)
+
+
+# =============================================================================
+# PROTOCOL ANOMALY DETECTION
+# =============================================================================
+# Detect protocol-level anomalies that may indicate C2 communication,
+# tunneling, or evasion techniques.
+# =============================================================================
+
+# -- HTTP traffic on non-standard port --
+# APTs sometimes run HTTP C2 on non-standard ports to evade detection.
+alert http $HOME_NET any -> $EXTERNAL_NET ![$HTTP_PORTS] (msg:"ANOMALY - HTTP traffic on non-standard port"; flow:to_server,established; classtype:trojan-activity; sid:1000500; rev:2; priority:3; metadata:mitre_attack T1571, deployment gke;)
+
+# -- DNS over non-standard port --
+# DNS tunneling tools sometimes use non-standard ports.
+alert udp $HOME_NET any -> $EXTERNAL_NET !53 (msg:"ANOMALY - DNS traffic on non-standard port (potential tunneling)"; content:"|00 01 00 00 00 00 00|"; offset:2; depth:7; classtype:trojan-activity; sid:1000501; rev:2; priority:2; metadata:mitre_attack T1071.004, deployment gke;)
+
+# -- ICMP tunneling detection --
+# Large ICMP packets can indicate ICMP tunneling for data exfiltration.
+alert icmp $HOME_NET any -> $EXTERNAL_NET any (msg:"ANOMALY - Large ICMP packet (potential ICMP tunneling)"; dsize:>800; classtype:trojan-activity; sid:1000502; rev:2; priority:3; metadata:mitre_attack T1095, deployment gke;)
+
+# -- Encrypted traffic to non-standard TLS port --
+# Legitimate TLS typically runs on 443, 8443, or other well-known ports.
+alert tls $HOME_NET any -> $EXTERNAL_NET ![443,8443,993,995,465,636,989,990] (msg:"ANOMALY - TLS traffic on non-standard port"; flow:to_server,established; classtype:trojan-activity; sid:1000503; rev:1; priority:3; metadata:mitre_attack T1573, deployment gke;)
+
+# -- Kubernetes API server access from outside cluster --
+alert tcp $EXTERNAL_NET any -> $HOME_NET 6443 (msg:"K8S - External connection to Kubernetes API server"; flow:to_server,established; classtype:attempted-admin; sid:1000504; rev:1; priority:2; metadata:mitre_attack T1190, deployment gke;)
+
+# -- GCP metadata server access with suspicious headers --
+# Attackers query the metadata server to steal service account tokens.
+alert http $HOME_NET any -> [169.254.169.254] any (msg:"GCP - Metadata server access (potential SA token theft)"; flow:to_server,established; content:"GET"; http_method; content:"/computeMetadata/"; http_uri; classtype:attempted-admin; sid:1000505; rev:2; priority:2; metadata:mitre_attack T1552.005, deployment gke;)

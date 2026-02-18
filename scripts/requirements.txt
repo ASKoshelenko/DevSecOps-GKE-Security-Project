@@ -1,0 +1,22 @@
+# ===========================================================================
+# Python dependencies for Trivy vulnerability extraction pipeline
+# ===========================================================================
+# Pin major.minor versions for reproducibility; allow patch-level updates.
+
+# Google Cloud BigQuery client library
+google-cloud-bigquery>=3.25,<4.0
+
+# Required for BigQuery Storage API (faster reads for large result sets)
+google-cloud-bigquery-storage>=2.25,<3.0
+
+# Google API core with retry and error handling utilities
+google-api-core>=2.19,<3.0
+
+# Google Auth for ADC and service account credentials
+google-auth>=2.30,<3.0
+
+# Apache Arrow / PyArrow for efficient data transfer with BigQuery Storage API
+pyarrow>=16.0,<18.0
+
+# Protobuf required by Google client libraries
+protobuf>=4.25,<6.0

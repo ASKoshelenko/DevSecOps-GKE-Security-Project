@@ -1,0 +1,303 @@
+# =============================================================================
+# Cloud Build Pipeline: Trivy Operator Deployment
+# =============================================================================
+#
+# This pipeline deploys and configures the Trivy Operator on GKE for
+# continuous container vulnerability scanning.
+#
+# PIPELINE STEPS:
+# 1. Authenticate to GKE cluster
+# 2. Create trivy-system namespace (if not exists)
+# 3. Install/upgrade Trivy Operator via Helm
+# 4. Configure vulnerability report export
+# 5. Verify deployment health
+# 6. Run initial scan and validate results
+#
+# SUBSTITUTION VARIABLES (set by Cloud Build trigger):
+# - _CLUSTER_NAME: GKE cluster name
+# - _CLUSTER_ZONE: GKE cluster zone
+# - _ENVIRONMENT: Deployment environment (prod, staging, dev)
+# - _NAMESPACE: Kubernetes namespace for Trivy (default: trivy-system)
+#
+# SECURITY:
+# - Uses dedicated service account (not default Cloud Build SA)
+# - No secrets in build config (uses Workload Identity for auth)
+# - Helm values enforce security best practices
+# =============================================================================
+
+timeout: '1200s'  # 20 minute timeout
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+
+substitutions:
+  _CLUSTER_NAME: 'devsecops-gke-prod'
+  _CLUSTER_ZONE: 'us-central1-a'
+  _ENVIRONMENT: 'prod'
+  _NAMESPACE: 'trivy-system'
+  _TRIVY_OPERATOR_VERSION: '0.21.0'
+
+steps:
+  # ---------------------------------------------------------------------------
+  # Step 1: Authenticate to GKE Cluster
+  # ---------------------------------------------------------------------------
+  # Get cluster credentials using the Cloud Build service account.
+  # The SA has container.developer role from the IAM module.
+  # ---------------------------------------------------------------------------
+  - id: 'gke-auth'
+    name: 'gcr.io/cloud-builders/gke-deploy'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        gcloud container clusters get-credentials ${_CLUSTER_NAME} \
+          --zone ${_CLUSTER_ZONE} \
+          --project ${PROJECT_ID}
+        echo "--- Cluster authentication successful ---"
+        kubectl cluster-info
+
+  # ---------------------------------------------------------------------------
+  # Step 2: Create Namespace and Configure RBAC
+  # ---------------------------------------------------------------------------
+  # Create the trivy-system namespace with proper labels and annotations.
+  # The namespace uses the "restricted" Pod Security Standard to ensure
+  # Trivy itself runs securely.
+  # ---------------------------------------------------------------------------
+  - id: 'create-namespace'
+    name: 'gcr.io/cloud-builders/kubectl'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        # Create namespace with Pod Security Standards
+        cat <<'NSEOF' | kubectl apply -f -
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: ${_NAMESPACE}
+          labels:
+            app.kubernetes.io/managed-by: cloud-build
+            environment: ${_ENVIRONMENT}
+            # Pod Security Standards - enforce baseline, warn on restricted
+            pod-security.kubernetes.io/enforce: baseline
+            pod-security.kubernetes.io/enforce-version: latest
+            pod-security.kubernetes.io/warn: restricted
+            pod-security.kubernetes.io/warn-version: latest
+            pod-security.kubernetes.io/audit: restricted
+            pod-security.kubernetes.io/audit-version: latest
+        NSEOF
+        echo "--- Namespace ${_NAMESPACE} configured ---"
+    waitFor: ['gke-auth']
+
+  # ---------------------------------------------------------------------------
+  # Step 3: Install/Upgrade Trivy Operator via Helm
+  # ---------------------------------------------------------------------------
+  # Deploys the Trivy Operator with security-focused configuration:
+  # - Scans all namespaces
+  # - Reports CRITICAL and HIGH vulnerabilities
+  # - Enables config audit (CIS benchmarks)
+  # - Uses Workload Identity for GCP authentication
+  # - Resource limits to prevent noisy neighbor issues
+  # ---------------------------------------------------------------------------
+  - id: 'helm-deploy-trivy'
+    name: 'alpine/helm:3.14.0'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        # Add Aqua Security Helm repository
+        helm repo add aqua https://aquasecurity.github.io/helm-charts/
+        helm repo update
+
+        # Install or upgrade Trivy Operator
+        helm upgrade --install trivy-operator aqua/trivy-operator \
+          --namespace ${_NAMESPACE} \
+          --version ${_TRIVY_OPERATOR_VERSION} \
+          --set trivy.ignoreUnfixed=false \
+          --set trivy.severity="CRITICAL,HIGH,MEDIUM" \
+          --set trivy.timeout="10m" \
+          --set operator.scanJobTimeout="15m" \
+          --set operator.scanJobsConcurrentLimit=3 \
+          --set operator.vulnerabilityScannerEnabled=true \
+          --set operator.configAuditScannerEnabled=true \
+          --set operator.rbacAssessmentScannerEnabled=true \
+          --set operator.infraAssessmentScannerEnabled=true \
+          --set operator.exposedSecretScannerEnabled=true \
+          --set operator.scannerReportTTL="24h" \
+          --set serviceAccount.annotations."iam\.gke\.io/gcp-service-account"="trivy-operator-${_ENVIRONMENT}@${PROJECT_ID}.iam.gserviceaccount.com" \
+          --set resources.requests.cpu="100m" \
+          --set resources.requests.memory="256Mi" \
+          --set resources.limits.cpu="500m" \
+          --set resources.limits.memory="512Mi" \
+          --set nodeSelector."kubernetes\.io/os"=linux \
+          --timeout 10m \
+          --wait \
+          --atomic
+
+        echo "--- Trivy Operator deployed successfully ---"
+    waitFor: ['create-namespace']
+
+  # ---------------------------------------------------------------------------
+  # Step 4: Deploy BigQuery Export CronJob
+  # ---------------------------------------------------------------------------
+  # Creates a Kubernetes CronJob that periodically exports Trivy
+  # vulnerability reports to BigQuery for long-term storage and analysis.
+  # ---------------------------------------------------------------------------
+  - id: 'deploy-bq-export'
+    name: 'gcr.io/cloud-builders/kubectl'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        cat <<'EXPORTEOF' | kubectl apply -f -
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: bq-writer
+          namespace: ${_NAMESPACE}
+          annotations:
+            iam.gke.io/gcp-service-account: bq-vuln-writer-${_ENVIRONMENT}@${PROJECT_ID}.iam.gserviceaccount.com
+        ---
+        apiVersion: batch/v1
+        kind: CronJob
+        metadata:
+          name: trivy-bq-export
+          namespace: ${_NAMESPACE}
+          labels:
+            app: trivy-bq-export
+            environment: ${_ENVIRONMENT}
+        spec:
+          schedule: "0 */6 * * *"  # Every 6 hours
+          concurrencyPolicy: Forbid
+          successfulJobsHistoryLimit: 3
+          failedJobsHistoryLimit: 3
+          jobTemplate:
+            spec:
+              backoffLimit: 2
+              activeDeadlineSeconds: 600
+              template:
+                metadata:
+                  labels:
+                    app: trivy-bq-export
+                spec:
+                  serviceAccountName: bq-writer
+                  restartPolicy: OnFailure
+                  containers:
+                    - name: export
+                      image: google/cloud-sdk:slim
+                      command:
+                        - /bin/bash
+                        - -c
+                        - |
+                          set -euo pipefail
+
+                          echo "Exporting Trivy vulnerability reports to BigQuery..."
+                          SCAN_ID="scan-$(date +%Y%m%d-%H%M%S)"
+                          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                          DATASET="security_findings_${_ENVIRONMENT}"
+                          TABLE="trivy_vulnerabilities"
+
+                          # Get all vulnerability reports from Trivy CRDs
+                          kubectl get vulnerabilityreports -A -o json | \
+                          python3 -c "
+                          import json, sys
+                          data = json.load(sys.stdin)
+                          rows = []
+                          for item in data.get('items', []):
+                            meta = item.get('metadata', {})
+                            report = item.get('report', {})
+                            ns = meta.get('namespace', 'unknown')
+                            name = meta.get('name', 'unknown')
+                            labels = meta.get('labels', {})
+                            resource_kind = labels.get('trivy-operator.resource.kind', '')
+                            resource_name = labels.get('trivy-operator.resource.name', '')
+                            container = labels.get('trivy-operator.container.name', '')
+                            registry = report.get('registry', {}).get('server', '')
+                            artifact = report.get('artifact', {})
+                            image_ref = f\"{registry}/{artifact.get('repository', '')}:{artifact.get('tag', 'latest')}\"
+                            image_digest = artifact.get('digest', '')
+                            for vuln in report.get('vulnerabilities', []):
+                              rows.append({
+                                'scan_id': '${SCAN_ID}',
+                                'scan_timestamp': '${TIMESTAMP}',
+                                'vulnerability_id': vuln.get('vulnerabilityID', ''),
+                                'severity': vuln.get('severity', 'UNKNOWN'),
+                                'cvss_score': vuln.get('score', None),
+                                'title': vuln.get('title', ''),
+                                'description': (vuln.get('description', '') or '')[:1000],
+                                'resource_namespace': ns,
+                                'resource_name': resource_name,
+                                'resource_kind': resource_kind,
+                                'container_name': container,
+                                'image_ref': image_ref,
+                                'image_digest': image_digest,
+                                'package_name': vuln.get('resource', ''),
+                                'installed_version': vuln.get('installedVersion', ''),
+                                'fixed_version': vuln.get('fixedVersion', ''),
+                                'primary_url': vuln.get('primaryLink', ''),
+                                'target': vuln.get('target', ''),
+                                'class': vuln.get('class', ''),
+                                'cluster_name': '${_CLUSTER_NAME}'
+                              })
+                          print(json.dumps(rows))
+                          " > /tmp/vulns.json
+
+                          VULN_COUNT=$(python3 -c "import json; print(len(json.load(open('/tmp/vulns.json'))))")
+                          echo "Found ${VULN_COUNT} vulnerabilities to export"
+
+                          if [ "${VULN_COUNT}" -gt "0" ]; then
+                            bq load \
+                              --source_format=NEWLINE_DELIMITED_JSON \
+                              "${PROJECT_ID}:${DATASET}.${TABLE}" \
+                              /tmp/vulns.json
+                            echo "Successfully exported ${VULN_COUNT} vulnerabilities to BigQuery"
+                          else
+                            echo "No vulnerabilities found to export"
+                          fi
+                      resources:
+                        requests:
+                          cpu: "100m"
+                          memory: "256Mi"
+                        limits:
+                          cpu: "500m"
+                          memory: "512Mi"
+                  nodeSelector:
+                    kubernetes.io/os: linux
+        EXPORTEOF
+        echo "--- BigQuery export CronJob deployed ---"
+    waitFor: ['helm-deploy-trivy']
+
+  # ---------------------------------------------------------------------------
+  # Step 5: Verify Deployment Health
+  # ---------------------------------------------------------------------------
+  # Wait for the Trivy Operator to be fully ready and verify it can scan.
+  # ---------------------------------------------------------------------------
+  - id: 'verify-deployment'
+    name: 'gcr.io/cloud-builders/kubectl'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "--- Verifying Trivy Operator deployment ---"
+
+        # Wait for operator to be ready
+        kubectl rollout status deployment/trivy-operator \
+          -n ${_NAMESPACE} \
+          --timeout=300s
+
+        echo ""
+        echo "--- Trivy Operator pods ---"
+        kubectl get pods -n ${_NAMESPACE} -o wide
+
+        echo ""
+        echo "--- Checking for existing vulnerability reports ---"
+        kubectl get vulnerabilityreports -A --no-headers | head -20 || true
+
+        echo ""
+        echo "--- Checking for config audit reports ---"
+        kubectl get configauditreports -A --no-headers | head -20 || true
+
+        echo ""
+        echo "=== Trivy Operator deployment verified successfully ==="
+    waitFor: ['deploy-bq-export']

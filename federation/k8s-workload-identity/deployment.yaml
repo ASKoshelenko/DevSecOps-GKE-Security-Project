@@ -1,0 +1,316 @@
+# =============================================================================
+# Example Deployment Using GKE Workload Identity
+# =============================================================================
+#
+# This deployment demonstrates a security-hardened pod configuration that uses
+# GKE Workload Identity for authentication to GCP services. The pod runs the
+# BigQuery exporter application, which aggregates Trivy scan results and
+# writes processed findings to BigQuery.
+#
+# SECURITY FEATURES:
+# - Workload Identity: No SA key files, uses metadata server for auth
+# - Non-root user: Container runs as non-root (UID 65534 / nobody)
+# - Read-only root filesystem: Prevents runtime modifications
+# - No privilege escalation: Blocks setuid/setgid
+# - Dropped capabilities: ALL capabilities dropped
+# - seccomp profile: RuntimeDefault for syscall filtering
+# - Resource limits: Prevents resource exhaustion / cryptomining
+# - Liveness/readiness probes: Ensures pod health
+# - Network policy: Restricts egress to required GCP APIs only
+#
+# =============================================================================
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bq-exporter
+  namespace: default
+  labels:
+    app.kubernetes.io/name: bq-exporter
+    app.kubernetes.io/component: data-pipeline
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/part-of: devsecops-security
+    app.kubernetes.io/version: "1.0.0"
+  annotations:
+    description: "Aggregates security scan results and exports to BigQuery via Workload Identity"
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bq-exporter
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bq-exporter
+        app.kubernetes.io/component: data-pipeline
+        app.kubernetes.io/part-of: devsecops-security
+      annotations:
+        # Trigger redeployment when config changes
+        checksum/config: "placeholder-update-with-actual-checksum"
+        # Disable Istio sidecar if not needed
+        sidecar.istio.io/inject: "false"
+    spec:
+      # -----------------------------------------------------------------------
+      # Service Account - Workload Identity
+      # -----------------------------------------------------------------------
+      # This KSA is annotated with the GSA email in service-account.yaml.
+      # The GKE metadata server will automatically provide GCP tokens
+      # when the pod requests credentials via the standard metadata endpoint.
+      # -----------------------------------------------------------------------
+      serviceAccountName: bq-exporter
+
+      # Do not auto-mount the Kubernetes service account token
+      # Workload Identity uses projected tokens instead
+      automountServiceAccountToken: false
+
+      # -----------------------------------------------------------------------
+      # Node Selection and Scheduling
+      # -----------------------------------------------------------------------
+      # Schedule on GKE nodes with Workload Identity enabled
+      nodeSelector:
+        iam.gke.io/gke-metadata-server-enabled: "true"
+
+      # Anti-affinity: spread replicas across nodes for HA
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app.kubernetes.io/name
+                      operator: In
+                      values:
+                        - bq-exporter
+                topologyKey: kubernetes.io/hostname
+
+      # -----------------------------------------------------------------------
+      # Security Context (Pod-level)
+      # -----------------------------------------------------------------------
+      securityContext:
+        # Run all containers as non-root
+        runAsNonRoot: true
+        runAsUser: 65534       # nobody
+        runAsGroup: 65534
+        fsGroup: 65534
+        # Apply seccomp profile
+        seccompProfile:
+          type: RuntimeDefault
+
+      # -----------------------------------------------------------------------
+      # Containers
+      # -----------------------------------------------------------------------
+      containers:
+        - name: bq-exporter
+          # Use a specific digest for image immutability
+          # In production, use Artifact Registry with Binary Authorization
+          image: us-central1-docker.pkg.dev/PROJECT_ID/devsecops-images/bq-exporter:latest
+          imagePullPolicy: Always
+
+          # -----------------------------------------------------------------------
+          # Container Security Context
+          # -----------------------------------------------------------------------
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities:
+              drop:
+                - ALL
+
+          # -----------------------------------------------------------------------
+          # Environment Variables
+          # -----------------------------------------------------------------------
+          env:
+            # GCP project ID
+            - name: GCP_PROJECT_ID
+              value: "PROJECT_ID"
+            # BigQuery dataset for security findings
+            - name: BQ_DATASET
+              value: "security_findings"
+            # BigQuery table for processed results
+            - name: BQ_TABLE
+              value: "processed_vulnerabilities"
+            # Processing interval
+            - name: EXPORT_INTERVAL_SECONDS
+              value: "300"
+            # Log level
+            - name: LOG_LEVEL
+              value: "info"
+            # Pod name (for logging)
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Node name (for logging)
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+          # -----------------------------------------------------------------------
+          # Resource Limits
+          # -----------------------------------------------------------------------
+          # Tight resource limits prevent abuse (e.g., cryptomining) and
+          # ensure predictable scheduling.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+              ephemeral-storage: 256Mi
+
+          # -----------------------------------------------------------------------
+          # Health Checks
+          # -----------------------------------------------------------------------
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # -----------------------------------------------------------------------
+          # Ports
+          # -----------------------------------------------------------------------
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+
+          # -----------------------------------------------------------------------
+          # Volume Mounts
+          # -----------------------------------------------------------------------
+          volumeMounts:
+            # Writable /tmp for temporary files (root FS is read-only)
+            - name: tmp
+              mountPath: /tmp
+
+      # -----------------------------------------------------------------------
+      # Volumes
+      # -----------------------------------------------------------------------
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+
+      # -----------------------------------------------------------------------
+      # Termination
+      # -----------------------------------------------------------------------
+      terminationGracePeriodSeconds: 30
+
+---
+# =============================================================================
+# NetworkPolicy - Restrict Egress to GCP APIs Only
+# =============================================================================
+# This network policy restricts the bq-exporter to only communicate with
+# GCP APIs (via Private Google Access) and the GKE metadata server.
+# All other egress traffic is blocked, preventing data exfiltration
+# and C2 communication if the pod is compromised.
+# =============================================================================
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bq-exporter-egress
+  namespace: default
+  labels:
+    app.kubernetes.io/name: bq-exporter
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: bq-exporter
+  policyTypes:
+    - Egress
+    - Ingress
+  ingress:
+    # Allow Prometheus scraping on metrics port
+    - ports:
+        - port: 9090
+          protocol: TCP
+  egress:
+    # Allow DNS resolution (required for GCP API hostname resolution)
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+    # Allow access to GKE metadata server (169.254.169.254)
+    # This is required for Workload Identity token exchange
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - port: 80
+          protocol: TCP
+        - port: 988
+          protocol: TCP
+
+    # Allow access to GCP APIs via Private Google Access
+    # restricted.googleapis.com (199.36.153.4/30) ensures traffic stays
+    # on Google's network and only VPC-SC allowed APIs are reachable
+    - to:
+        - ipBlock:
+            cidr: 199.36.153.4/30
+      ports:
+        - port: 443
+          protocol: TCP
+
+    # Allow access to GCP APIs via private.googleapis.com
+    - to:
+        - ipBlock:
+            cidr: 199.36.153.8/30
+      ports:
+        - port: 443
+          protocol: TCP
+
+---
+# =============================================================================
+# PodDisruptionBudget - Ensure Availability During Upgrades
+# =============================================================================
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: bq-exporter-pdb
+  namespace: default
+  labels:
+    app.kubernetes.io/name: bq-exporter
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bq-exporter

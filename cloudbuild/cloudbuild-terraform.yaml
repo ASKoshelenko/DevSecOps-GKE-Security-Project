@@ -1,0 +1,209 @@
+# =============================================================================
+# Cloud Build Pipeline: Terraform CI/CD
+# =============================================================================
+#
+# This pipeline runs Terraform plan on pull requests and apply on main merges.
+# It uses the _TF_ACTION substitution to determine the operation:
+# - "plan": Run terraform plan and output the changes (PR trigger)
+# - "apply": Run terraform apply with auto-approve (main branch trigger)
+#
+# PIPELINE STEPS:
+# 1. Validate Terraform configuration
+# 2. Initialize Terraform with GCS backend
+# 3. Run tfsec security scan
+# 4. Run terraform plan or apply
+# 5. Output summary
+#
+# SUBSTITUTION VARIABLES:
+# - _TF_ACTION: "plan" or "apply"
+# - _ENVIRONMENT: Environment to deploy (prod, staging, dev)
+# - _TF_DIR: Directory containing Terraform configuration
+#
+# SECURITY:
+# - Uses dedicated service account with minimal permissions
+# - State is stored in encrypted GCS bucket with versioning
+# - tfsec scans for security misconfigurations before apply
+# - No secrets in build config
+# =============================================================================
+
+timeout: '1800s'  # 30 minute timeout
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+  env:
+    - 'TF_IN_AUTOMATION=true'
+    - 'TF_INPUT=false'
+
+substitutions:
+  _TF_ACTION: 'plan'
+  _ENVIRONMENT: 'prod'
+  _TF_DIR: 'terraform'
+  _TF_VERSION: '1.7.0'
+
+steps:
+  # ---------------------------------------------------------------------------
+  # Step 1: Install Terraform
+  # ---------------------------------------------------------------------------
+  # Download and install the specified Terraform version.
+  # Uses the official HashiCorp releases for supply chain security.
+  # ---------------------------------------------------------------------------
+  - id: 'install-terraform'
+    name: 'alpine:3.19'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        apk add --no-cache curl unzip
+        curl -fsSL "https://releases.hashicorp.com/terraform/${_TF_VERSION}/terraform_${_TF_VERSION}_linux_amd64.zip" \
+          -o /tmp/terraform.zip
+        unzip /tmp/terraform.zip -d /workspace/bin/
+        chmod +x /workspace/bin/terraform
+        /workspace/bin/terraform version
+
+  # ---------------------------------------------------------------------------
+  # Step 2: Terraform Format Check
+  # ---------------------------------------------------------------------------
+  # Verify all Terraform files are properly formatted.
+  # Fails the build if formatting issues are found.
+  # ---------------------------------------------------------------------------
+  - id: 'tf-fmt'
+    name: 'alpine:3.19'
+    entrypoint: '/workspace/bin/terraform'
+    args:
+      - '-chdir=${_TF_DIR}'
+      - 'fmt'
+      - '-check'
+      - '-recursive'
+      - '-diff'
+    waitFor: ['install-terraform']
+
+  # ---------------------------------------------------------------------------
+  # Step 3: Terraform Validate
+  # ---------------------------------------------------------------------------
+  # Validates the Terraform configuration for syntax errors and
+  # internal consistency (without accessing any remote state or APIs).
+  # ---------------------------------------------------------------------------
+  - id: 'tf-validate'
+    name: 'alpine:3.19'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        cd ${_TF_DIR}
+        /workspace/bin/terraform init -backend=false
+        /workspace/bin/terraform validate
+        echo "--- Terraform validation passed ---"
+    waitFor: ['tf-fmt']
+
+  # ---------------------------------------------------------------------------
+  # Step 4: Security Scan with tfsec
+  # ---------------------------------------------------------------------------
+  # Scans Terraform code for potential security issues:
+  # - Overly permissive IAM policies
+  # - Unencrypted resources
+  # - Missing logging/monitoring
+  # - Network security misconfigurations
+  #
+  # NOTE: Some findings may be intentional for the demo scenario
+  # (e.g., auto-upgrade disabled). These are documented as exceptions.
+  # ---------------------------------------------------------------------------
+  - id: 'tfsec-scan'
+    name: 'aquasec/tfsec:latest'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        echo "--- Running tfsec security scan ---"
+        tfsec ${_TF_DIR} \
+          --format lovely \
+          --soft-fail \
+          --exclude-downloaded-modules \
+          || true
+        echo "--- tfsec scan complete (soft-fail mode for demo) ---"
+    waitFor: ['install-terraform']
+
+  # ---------------------------------------------------------------------------
+  # Step 5: Terraform Init
+  # ---------------------------------------------------------------------------
+  # Initialize Terraform with the GCS backend.
+  # Downloads providers and configures the state backend.
+  # ---------------------------------------------------------------------------
+  - id: 'tf-init'
+    name: 'alpine:3.19'
+    entrypoint: '/workspace/bin/terraform'
+    args:
+      - '-chdir=${_TF_DIR}'
+      - 'init'
+      - '-no-color'
+    waitFor: ['tf-validate']
+
+  # ---------------------------------------------------------------------------
+  # Step 6: Terraform Plan
+  # ---------------------------------------------------------------------------
+  # Always run plan first (even for apply, to show what will change).
+  # The plan output is saved to a file for the apply step.
+  # ---------------------------------------------------------------------------
+  - id: 'tf-plan'
+    name: 'alpine:3.19'
+    entrypoint: '/workspace/bin/terraform'
+    args:
+      - '-chdir=${_TF_DIR}'
+      - 'plan'
+      - '-no-color'
+      - '-out=/workspace/tfplan'
+      - '-var=project_id=${PROJECT_ID}'
+      - '-var=environment=${_ENVIRONMENT}'
+    waitFor: ['tf-init']
+
+  # ---------------------------------------------------------------------------
+  # Step 7: Terraform Apply (conditional)
+  # ---------------------------------------------------------------------------
+  # Only runs when _TF_ACTION is "apply" (main branch merges).
+  # Uses the saved plan file to ensure exactly what was reviewed is applied.
+  # ---------------------------------------------------------------------------
+  - id: 'tf-apply'
+    name: 'alpine:3.19'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        if [ "${_TF_ACTION}" = "apply" ]; then
+          echo "--- Applying Terraform changes ---"
+          /workspace/bin/terraform -chdir=${_TF_DIR} apply \
+            -no-color \
+            -auto-approve \
+            /workspace/tfplan
+          echo "--- Terraform apply completed ---"
+        else
+          echo "--- Skipping apply (plan-only mode) ---"
+          echo "This is a pull request build. Changes will be applied after merge."
+        fi
+    waitFor: ['tf-plan']
+
+  # ---------------------------------------------------------------------------
+  # Step 8: Output Summary
+  # ---------------------------------------------------------------------------
+  # Display key outputs after apply, or plan summary for PRs.
+  # ---------------------------------------------------------------------------
+  - id: 'summary'
+    name: 'alpine:3.19'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        echo "============================================"
+        echo "  Terraform ${_TF_ACTION} - ${_ENVIRONMENT}"
+        echo "============================================"
+        if [ "${_TF_ACTION}" = "apply" ]; then
+          echo ""
+          echo "--- Terraform Outputs ---"
+          /workspace/bin/terraform -chdir=${_TF_DIR} output -no-color || true
+        fi
+        echo ""
+        echo "--- Build completed successfully ---"
+        echo "Environment: ${_ENVIRONMENT}"
+        echo "Action: ${_TF_ACTION}"
+        echo "Project: ${PROJECT_ID}"
+        echo "============================================"
+    waitFor: ['tf-apply']

@@ -1,0 +1,200 @@
+# =============================================================================
+# Cloud Logging Filters for Service Account Key Monitoring
+# =============================================================================
+#
+# These filters can be used in:
+# - Cloud Logging console (Logs Explorer)
+# - Log-based metrics (Cloud Monitoring)
+# - Log sinks (BigQuery, Cloud Storage, Pub/Sub export)
+# - gcloud logging read --filter="..."
+#
+# Copy and paste these filters into the appropriate tool.
+# Lines starting with # are comments and should be removed.
+#
+# =============================================================================
+
+
+# =============================================================================
+# FILTER 1: All SA Key Authentication Events
+# =============================================================================
+# Matches any API call that was authenticated using a service account key.
+# After WIF migration, this filter should return ZERO results.
+# If results appear, it indicates a compromised or unmigrated key.
+#
+# Use case: Main monitoring filter - alert on any match
+# =============================================================================
+
+resource.type="audited_resource" OR resource.type="gce_instance" OR resource.type="k8s_cluster"
+protoPayload.authenticationInfo.serviceAccountKeyName!=""
+protoPayload.authenticationInfo.serviceAccountKeyName!~"system-managed"
+severity>="NOTICE"
+
+
+# =============================================================================
+# FILTER 2: SA Key Creation Attempts (Blocked by Org Policy)
+# =============================================================================
+# Matches attempts to create or upload service account keys.
+# With org policies enforced, these will have status.code=7 (PERMISSION_DENIED).
+# A status.code=0 indicates the policy is NOT enforced (critical issue).
+#
+# Use case: Detect policy bypass or misconfiguration
+# =============================================================================
+
+resource.type="service_account"
+protoPayload.methodName=("google.iam.admin.v1.CreateServiceAccountKey" OR "google.iam.admin.v1.UploadServiceAccountKey")
+
+
+# =============================================================================
+# FILTER 3: SA Key Creation Attempts That SUCCEEDED
+# =============================================================================
+# This should NEVER return results if org policies are correctly enforced.
+# If this filter returns any results, the org policy is broken or bypassed.
+# TREAT AS P1 INCIDENT.
+#
+# Use case: Verify org policy enforcement
+# =============================================================================
+
+resource.type="service_account"
+protoPayload.methodName=("google.iam.admin.v1.CreateServiceAccountKey" OR "google.iam.admin.v1.UploadServiceAccountKey")
+protoPayload.status.code=0
+
+
+# =============================================================================
+# FILTER 4: SA Key Lifecycle Events (Disable, Enable, Delete)
+# =============================================================================
+# Tracks when SA keys are disabled, re-enabled, or deleted.
+# During migration: expect many disable/delete events (normal)
+# After migration: an "enable" event is suspicious
+#
+# Use case: Track migration progress and detect key re-activation
+# =============================================================================
+
+resource.type="service_account"
+protoPayload.methodName=("google.iam.admin.v1.DeleteServiceAccountKey" OR "google.iam.admin.v1.DisableServiceAccountKey" OR "google.iam.admin.v1.EnableServiceAccountKey")
+
+
+# =============================================================================
+# FILTER 5: SA Key Re-enabled After Disable
+# =============================================================================
+# Matches ONLY re-enable events. This is the highest-priority filter
+# because re-enabling a disabled key is a strong indicator of attacker
+# persistence (re-activating a key that was disabled during incident response).
+#
+# Use case: Critical security alert
+# =============================================================================
+
+resource.type="service_account"
+protoPayload.methodName="google.iam.admin.v1.EnableServiceAccountKey"
+
+
+# =============================================================================
+# FILTER 6: Workload Identity Federation Token Exchange Events
+# =============================================================================
+# Matches STS (Security Token Service) token exchange events, which occur
+# when GitHub Actions or other external workloads authenticate via WIF.
+# This is EXPECTED traffic and should be the ONLY authentication method
+# after migration.
+#
+# Use case: Verify WIF is being used correctly, audit token exchanges
+# =============================================================================
+
+resource.type="audited_resource"
+protoPayload.serviceName="sts.googleapis.com"
+protoPayload.methodName="google.identity.sts.v1.SecurityTokenService.ExchangeToken"
+
+
+# =============================================================================
+# FILTER 7: WIF Token Exchange Failures
+# =============================================================================
+# Matches FAILED WIF token exchanges. Common causes:
+# - Attribute condition mismatch (wrong repo, branch, or runner)
+# - Expired or invalid OIDC token from GitHub
+# - Misconfigured WIF provider
+# - Attacker trying to authenticate from unauthorized repo
+#
+# Use case: Detect WIF misconfiguration or unauthorized access attempts
+# =============================================================================
+
+resource.type="audited_resource"
+protoPayload.serviceName="sts.googleapis.com"
+protoPayload.methodName="google.identity.sts.v1.SecurityTokenService.ExchangeToken"
+severity>="ERROR"
+
+
+# =============================================================================
+# FILTER 8: SA Impersonation via WIF (IAM Credentials API)
+# =============================================================================
+# After WIF token exchange, the federated token is exchanged for a SA token
+# via the IAM Credentials API. This filter tracks those exchanges.
+#
+# Use case: Audit which SAs are being impersonated and by whom
+# =============================================================================
+
+resource.type="service_account"
+protoPayload.serviceName="iamcredentials.googleapis.com"
+protoPayload.methodName="GenerateAccessToken"
+
+
+# =============================================================================
+# FILTER 9: Suspicious SA Activity (Comprehensive)
+# =============================================================================
+# Broad filter that captures any SA-related security events:
+# - Key creation/deletion/lifecycle
+# - SA creation/deletion
+# - IAM policy changes on SAs
+# - Impersonation attempts
+#
+# Use case: Comprehensive SA security monitoring dashboard
+# =============================================================================
+
+resource.type="service_account"
+protoPayload.methodName=~"ServiceAccount"
+severity>="NOTICE"
+
+
+# =============================================================================
+# FILTER 10: GKE Workload Identity Metadata Server Events
+# =============================================================================
+# Tracks metadata server access from GKE pods. The GKE metadata server
+# proxy handles Workload Identity token requests.
+#
+# Use case: Monitor Workload Identity usage in GKE pods
+# =============================================================================
+
+resource.type="k8s_cluster"
+protoPayload.resourceName=~"workloadIdentity"
+
+
+# =============================================================================
+# FILTER 11: Org Policy Violation Attempts (All Constraints)
+# =============================================================================
+# Matches any operation that was denied by an organization policy constraint.
+# Includes SA key creation, VM external IP, SQL public IP, etc.
+#
+# Use case: Compliance monitoring dashboard
+# =============================================================================
+
+protoPayload.status.message=~"constraint"
+severity>="WARNING"
+
+
+# =============================================================================
+# FILTER 12: High-Risk SA API Calls (Data Exfiltration Indicators)
+# =============================================================================
+# Matches SA-authenticated calls to APIs commonly used for data exfiltration:
+# - BigQuery data export
+# - Cloud Storage object creation/download
+# - Compute instance creation (potential cryptominer)
+#
+# Use case: Detect potential data exfiltration from compromised SA
+# =============================================================================
+
+protoPayload.authenticationInfo.principalEmail=~"@.*\\.iam\\.gserviceaccount\\.com$"
+(
+  (protoPayload.serviceName="bigquery.googleapis.com" AND protoPayload.methodName=~"extract|export|getQueryResults")
+  OR
+  (protoPayload.serviceName="storage.googleapis.com" AND protoPayload.methodName=~"objects\\.create|objects\\.get")
+  OR
+  (protoPayload.serviceName="compute.googleapis.com" AND protoPayload.methodName=~"instances\\.insert")
+)
+severity>="NOTICE"

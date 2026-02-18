@@ -1,0 +1,128 @@
+# =============================================================================
+# OPA Gatekeeper Constraint: Deny Host Namespace Access
+# =============================================================================
+#
+# PURPOSE: Prevents pods from sharing the host's PID, IPC, and network
+# namespaces. Access to host namespaces is a primary container escape vector.
+#
+# WHAT IT BLOCKS:
+#   - spec.hostPID: true     (access to all host processes)
+#   - spec.hostIPC: true     (access to host shared memory)
+#   - spec.hostNetwork: true (access to host network interfaces)
+#
+# WHY THIS MATTERS:
+#   - hostPID: Allows reading host /proc, process manipulation, credential theft
+#   - hostIPC: Allows accessing host shared memory segments (database caches, etc.)
+#   - hostNetwork: Allows binding to host ports, sniffing all host traffic
+#
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# ConstraintTemplate: Deny host namespace access
+# ---------------------------------------------------------------------------
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sdenyhostnamespaces
+  annotations:
+    description: "Denies pods that use host PID, IPC, or network namespaces"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sDenyHostNamespaces
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            allowHostPID:
+              type: boolean
+              description: "Allow host PID namespace (default: false)"
+            allowHostIPC:
+              type: boolean
+              description: "Allow host IPC namespace (default: false)"
+            allowHostNetwork:
+              type: boolean
+              description: "Allow host network namespace (default: false)"
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sdenyhostnamespaces
+
+        # Deny hostPID
+        violation[{"msg": msg}] {
+            input.review.object.spec.hostPID == true
+            not allow_host_pid
+            msg := sprintf(
+                "DENIED: Pod '%s' uses hostPID: true. " +
+                "Sharing the host PID namespace allows container escape " +
+                "via /proc/1/root and process manipulation. " +
+                "Remove 'hostPID: true' from the pod spec.",
+                [input.review.object.metadata.name]
+            )
+        }
+
+        # Deny hostIPC
+        violation[{"msg": msg}] {
+            input.review.object.spec.hostIPC == true
+            not allow_host_ipc
+            msg := sprintf(
+                "DENIED: Pod '%s' uses hostIPC: true. " +
+                "Sharing the host IPC namespace allows access to host " +
+                "shared memory segments. Remove 'hostIPC: true' from the pod spec.",
+                [input.review.object.metadata.name]
+            )
+        }
+
+        # Deny hostNetwork
+        violation[{"msg": msg}] {
+            input.review.object.spec.hostNetwork == true
+            not allow_host_network
+            msg := sprintf(
+                "DENIED: Pod '%s' uses hostNetwork: true. " +
+                "Sharing the host network namespace allows binding to " +
+                "host ports and sniffing host traffic. " +
+                "Remove 'hostNetwork: true' from the pod spec.",
+                [input.review.object.metadata.name]
+            )
+        }
+
+        # Helper: Check if hostPID is explicitly allowed
+        allow_host_pid {
+            input.parameters.allowHostPID == true
+        }
+
+        # Helper: Check if hostIPC is explicitly allowed
+        allow_host_ipc {
+            input.parameters.allowHostIPC == true
+        }
+
+        # Helper: Check if hostNetwork is explicitly allowed
+        allow_host_network {
+            input.parameters.allowHostNetwork == true
+        }
+
+---
+# ---------------------------------------------------------------------------
+# Constraint: Apply the policy cluster-wide
+# ---------------------------------------------------------------------------
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sDenyHostNamespaces
+metadata:
+  name: deny-host-namespaces
+  annotations:
+    description: "Deny host PID, IPC, and network namespace access"
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces:
+      - kube-system
+      - gatekeeper-system
+  parameters:
+    # All host namespaces denied by default
+    allowHostPID: false
+    allowHostIPC: false
+    allowHostNetwork: false

@@ -1,0 +1,126 @@
+# =============================================================================
+# OPA Gatekeeper Constraint: Deny Privilege Escalation
+# =============================================================================
+#
+# PURPOSE: Enforces that all containers must set
+# allowPrivilegeEscalation: false. This prevents processes inside the
+# container from gaining more privileges than their parent process.
+#
+# WHAT IT BLOCKS:
+#   - Containers without allowPrivilegeEscalation: false
+#   - Setuid/setgid binary exploitation
+#   - no_new_privs not being set
+#
+# WHY THIS MATTERS:
+#   Without this setting, a process inside the container can use setuid
+#   binaries (like sudo, su, passwd) to escalate privileges. Combined
+#   with other misconfigurations, this can lead to container escape.
+#
+#   The Linux kernel's no_new_privs flag, when set, prevents processes
+#   from gaining additional privileges through execve() calls. Setting
+#   allowPrivilegeEscalation: false enables this flag.
+#
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# ConstraintTemplate: Deny privilege escalation
+# ---------------------------------------------------------------------------
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sdenyprivilegeescalation
+  annotations:
+    description: "Requires all containers to set allowPrivilegeEscalation: false"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sDenyPrivilegeEscalation
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            exemptImages:
+              type: array
+              description: "Images exempt from this policy"
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sdenyprivilegeescalation
+
+        # Check regular containers
+        violation[{"msg": msg}] {
+            container := input.review.object.spec.containers[_]
+            not is_exempt(container.image)
+            has_privilege_escalation(container)
+            msg := sprintf(
+                "DENIED: Container '%s' in pod '%s' allows privilege escalation. " +
+                "Set 'securityContext.allowPrivilegeEscalation: false' to prevent " +
+                "processes from gaining additional privileges via setuid binaries.",
+                [container.name, input.review.object.metadata.name]
+            )
+        }
+
+        # Check init containers
+        violation[{"msg": msg}] {
+            container := input.review.object.spec.initContainers[_]
+            not is_exempt(container.image)
+            has_privilege_escalation(container)
+            msg := sprintf(
+                "DENIED: Init container '%s' in pod '%s' allows privilege escalation. " +
+                "Set 'securityContext.allowPrivilegeEscalation: false'.",
+                [container.name, input.review.object.metadata.name]
+            )
+        }
+
+        # Check ephemeral containers
+        violation[{"msg": msg}] {
+            container := input.review.object.spec.ephemeralContainers[_]
+            not is_exempt(container.image)
+            has_privilege_escalation(container)
+            msg := sprintf(
+                "DENIED: Ephemeral container '%s' in pod '%s' allows privilege escalation.",
+                [container.name, input.review.object.metadata.name]
+            )
+        }
+
+        # A container allows privilege escalation if:
+        # 1. allowPrivilegeEscalation is explicitly true, OR
+        # 2. allowPrivilegeEscalation is not set (defaults to true)
+        has_privilege_escalation(container) {
+            container.securityContext.allowPrivilegeEscalation == true
+        }
+
+        has_privilege_escalation(container) {
+            not container.securityContext.allowPrivilegeEscalation == false
+        }
+
+        # Exempt image check
+        is_exempt(image) {
+            exempt := input.parameters.exemptImages[_]
+            glob.match(exempt, ["/"], image)
+        }
+
+---
+# ---------------------------------------------------------------------------
+# Constraint: Enforce across the cluster
+# ---------------------------------------------------------------------------
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sDenyPrivilegeEscalation
+metadata:
+  name: deny-privilege-escalation
+  annotations:
+    description: "Require allowPrivilegeEscalation: false on all containers"
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces:
+      - kube-system
+      - gatekeeper-system
+  parameters:
+    exemptImages: []

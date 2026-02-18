@@ -1,0 +1,192 @@
+# =============================================================================
+# Restricted Pod Security Standard (PSS) - Maximum Security
+# =============================================================================
+#
+# PURPOSE: Enforces the 'restricted' Pod Security Standard on a namespace.
+# This is the most restrictive PSS profile and prevents ALL known container
+# escape vectors.
+#
+# THE RESTRICTED PROFILE ENFORCES:
+#   - Must run as non-root
+#   - Must not use privileged containers
+#   - Must not use host namespaces (hostPID, hostNetwork, hostIPC)
+#   - Must not use hostPath volumes
+#   - Must drop ALL capabilities (may add only NET_BIND_SERVICE)
+#   - Must set allowPrivilegeEscalation: false
+#   - Must use RuntimeDefault or Localhost seccomp profile
+#   - Must not use certain volume types
+#   - AppArmor profile must not be explicitly disabled
+#   - Seccomp profile must be set
+#
+# APPLY:
+#   kubectl apply -f restricted-pss.yaml
+#
+# PSS is built into Kubernetes since v1.23 (stable in v1.25).
+# It uses namespace labels to control enforcement.
+#
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Restricted Namespace - Production workloads
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    # ENFORCE: Reject pods that violate the restricted policy
+    # Pods that violate will NOT be created
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+
+    # WARN: Log a warning for violations (useful during migration)
+    # Pods are still created but a warning is shown to the user
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+
+    # AUDIT: Log violations to the audit log
+    # Does not affect pod creation, only logging
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+
+    # Custom labels for organization
+    environment: production
+    security-profile: restricted
+
+---
+# ---------------------------------------------------------------------------
+# Example: Pod that PASSES the restricted policy
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Pod
+metadata:
+  name: restricted-compliant-pod
+  namespace: production
+  labels:
+    app: secure-app
+spec:
+  # Do NOT use host namespaces
+  # hostPID: false      (default, but explicit for clarity)
+  # hostNetwork: false   (default)
+  # hostIPC: false       (default)
+
+  # Use a non-root service account with minimal permissions
+  serviceAccountName: default
+  automountServiceAccountToken: false  # Disable unless needed
+
+  securityContext:
+    # Pod-level: run as non-root
+    runAsNonRoot: true
+    # Use a specific non-root UID
+    runAsUser: 65534
+    runAsGroup: 65534
+    fsGroup: 65534
+    # Set supplemental groups
+    supplementalGroups: [65534]
+    # Seccomp profile at pod level
+    seccompProfile:
+      type: RuntimeDefault
+
+  containers:
+    - name: app
+      image: nginx:1.25-alpine
+      ports:
+        - containerPort: 8080  # Non-privileged port (>1024)
+          protocol: TCP
+
+      securityContext:
+        # REQUIRED: Run as non-root
+        runAsNonRoot: true
+        runAsUser: 65534
+
+        # REQUIRED: Disallow privilege escalation
+        allowPrivilegeEscalation: false
+
+        # REQUIRED: Read-only root filesystem
+        readOnlyRootFilesystem: true
+
+        # REQUIRED: Drop ALL capabilities
+        capabilities:
+          drop:
+            - ALL
+          # Only NET_BIND_SERVICE is allowed in restricted profile
+          # add:
+          #   - NET_BIND_SERVICE
+
+        # REQUIRED: Seccomp profile
+        seccompProfile:
+          type: RuntimeDefault
+
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "50m"
+        limits:
+          memory: "128Mi"
+          cpu: "200m"
+
+      # Only allowed volume types: configMap, emptyDir, projected,
+      # secret, downwardAPI, csi, persistentVolumeClaim, ephemeral
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: app-config
+          mountPath: /etc/app
+          readOnly: true
+
+  volumes:
+    # emptyDir is allowed
+    - name: tmp
+      emptyDir:
+        sizeLimit: "64Mi"
+    # configMap is allowed
+    - name: app-config
+      configMap:
+        name: app-config
+        optional: true
+
+---
+# ---------------------------------------------------------------------------
+# Example: Pod that FAILS the restricted policy (for comparison)
+# ---------------------------------------------------------------------------
+# apiVersion: v1
+# kind: Pod
+# metadata:
+#   name: restricted-violating-pod
+#   namespace: production
+# spec:
+#   # VIOLATION 1: hostPID
+#   hostPID: true
+#   # VIOLATION 2: hostNetwork
+#   hostNetwork: true
+#   containers:
+#     - name: bad-container
+#       image: ubuntu:22.04
+#       securityContext:
+#         # VIOLATION 3: privileged
+#         privileged: true
+#         # VIOLATION 4: running as root
+#         runAsUser: 0
+#         # VIOLATION 5: privilege escalation allowed
+#         allowPrivilegeEscalation: true
+#         # VIOLATION 6: dangerous capabilities
+#         capabilities:
+#           add:
+#             - SYS_ADMIN
+#             - NET_RAW
+#       volumeMounts:
+#         - name: host-root
+#           mountPath: /host
+#   volumes:
+#     # VIOLATION 7: hostPath volume
+#     - name: host-root
+#       hostPath:
+#         path: /
+#
+# The above pod would be REJECTED with errors like:
+#   - "hostPID: true is not allowed"
+#   - "hostNetwork: true is not allowed"
+#   - "privileged: true is not allowed"
+#   - "runAsUser: 0 is not allowed (must be non-root)"
+#   - "capabilities.add: SYS_ADMIN is not allowed"
+#   - "hostPath volumes are not allowed"

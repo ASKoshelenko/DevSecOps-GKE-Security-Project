@@ -1,0 +1,567 @@
+{
+  "_comment": "Elasticsearch Index Template for Security Events - APT Detection",
+  "_description": [
+    "This template defines the index mapping for all security events collected",
+    "from Falco (runtime detection), Suricata (network IDS), and Kubernetes",
+    "audit logs. It uses ECS (Elastic Common Schema) field naming conventions",
+    "for compatibility with Elastic Security features.",
+    "",
+    "The template covers three index patterns:",
+    "  - falco-alerts-*      : Runtime security events from Falco",
+    "  - suricata-alerts-*   : Network IDS events from Suricata",
+    "  - apt-detections-*    : Correlated APT indicator events",
+    "  - critical-alerts-*   : High-severity events for real-time dashboards",
+    "  - k8s-audit-*         : Kubernetes API audit events"
+  ],
+  "index_patterns": [
+    "falco-alerts-*",
+    "suricata-alerts-*",
+    "apt-detections-*",
+    "critical-alerts-*",
+    "k8s-audit-*",
+    "security-events-*",
+    "container-logs-*"
+  ],
+  "template": {
+    "settings": {
+      "index": {
+        "number_of_shards": 2,
+        "number_of_replicas": 1,
+        "refresh_interval": "5s",
+        "codec": "best_compression",
+        "max_result_window": 50000,
+        "mapping": {
+          "total_fields": {
+            "limit": 5000
+          }
+        },
+        "lifecycle": {
+          "name": "security-events-policy",
+          "rollover_alias": "security-events"
+        },
+        "sort.field": "@timestamp",
+        "sort.order": "desc"
+      },
+      "analysis": {
+        "analyzer": {
+          "command_line_analyzer": {
+            "type": "custom",
+            "tokenizer": "standard",
+            "filter": ["lowercase"]
+          }
+        }
+      }
+    },
+    "mappings": {
+      "dynamic": "true",
+      "dynamic_templates": [
+        {
+          "strings_as_keywords": {
+            "match_mapping_type": "string",
+            "mapping": {
+              "type": "keyword",
+              "ignore_above": 1024
+            }
+          }
+        }
+      ],
+      "properties": {
+        "@timestamp": {
+          "type": "date"
+        },
+
+        "event": {
+          "properties": {
+            "module": {
+              "type": "keyword",
+              "doc_values": true
+            },
+            "kind": {
+              "type": "keyword"
+            },
+            "category": {
+              "type": "keyword"
+            },
+            "type": {
+              "type": "keyword"
+            },
+            "severity": {
+              "type": "keyword"
+            },
+            "severity_id": {
+              "type": "integer"
+            },
+            "hash": {
+              "type": "keyword"
+            }
+          }
+        },
+
+        "source": {
+          "type": "keyword"
+        },
+        "log_type": {
+          "type": "keyword"
+        },
+        "environment": {
+          "type": "keyword"
+        },
+        "tags": {
+          "type": "keyword"
+        },
+        "message": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 2048
+            }
+          }
+        },
+
+        "alert": {
+          "properties": {
+            "severity": {
+              "type": "keyword"
+            }
+          }
+        },
+
+        "threat": {
+          "properties": {
+            "score": {
+              "type": "integer"
+            },
+            "is_apt": {
+              "type": "boolean"
+            },
+            "framework": {
+              "type": "keyword"
+            },
+            "technique": {
+              "properties": {
+                "id": {
+                  "type": "keyword"
+                },
+                "name": {
+                  "type": "keyword"
+                }
+              }
+            },
+            "indicator": {
+              "properties": {
+                "type": {
+                  "type": "keyword"
+                },
+                "description": {
+                  "type": "text"
+                },
+                "matched": {
+                  "type": "keyword"
+                }
+              }
+            }
+          }
+        },
+
+        "falco": {
+          "properties": {
+            "priority": {
+              "type": "keyword"
+            },
+            "rule": {
+              "type": "keyword"
+            },
+            "output": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 2048
+                }
+              }
+            },
+            "tags": {
+              "type": "keyword"
+            },
+            "output_fields": {
+              "type": "object",
+              "dynamic": true
+            }
+          }
+        },
+
+        "suricata": {
+          "properties": {
+            "event_type": {
+              "type": "keyword"
+            },
+            "src_ip": {
+              "type": "ip"
+            },
+            "dest_ip": {
+              "type": "ip"
+            },
+            "src_port": {
+              "type": "integer"
+            },
+            "dest_port": {
+              "type": "integer"
+            },
+            "proto": {
+              "type": "keyword"
+            },
+            "alert": {
+              "properties": {
+                "signature": {
+                  "type": "text",
+                  "fields": {
+                    "keyword": {
+                      "type": "keyword",
+                      "ignore_above": 512
+                    }
+                  }
+                },
+                "signature_id": {
+                  "type": "integer"
+                },
+                "severity": {
+                  "type": "integer"
+                },
+                "category": {
+                  "type": "keyword"
+                },
+                "rev": {
+                  "type": "integer"
+                }
+              }
+            },
+            "tls": {
+              "properties": {
+                "subject": {
+                  "type": "keyword"
+                },
+                "issuerdn": {
+                  "type": "keyword"
+                },
+                "ja3": {
+                  "properties": {
+                    "hash": {
+                      "type": "keyword"
+                    },
+                    "string": {
+                      "type": "keyword"
+                    }
+                  }
+                },
+                "ja3s": {
+                  "properties": {
+                    "hash": {
+                      "type": "keyword"
+                    }
+                  }
+                },
+                "sni": {
+                  "type": "keyword"
+                },
+                "version": {
+                  "type": "keyword"
+                }
+              }
+            },
+            "dns": {
+              "properties": {
+                "type": {
+                  "type": "keyword"
+                },
+                "rrname": {
+                  "type": "keyword"
+                },
+                "rrtype": {
+                  "type": "keyword"
+                },
+                "rcode": {
+                  "type": "keyword"
+                }
+              }
+            },
+            "http": {
+              "properties": {
+                "hostname": {
+                  "type": "keyword"
+                },
+                "url": {
+                  "type": "text",
+                  "fields": {
+                    "keyword": {
+                      "type": "keyword",
+                      "ignore_above": 2048
+                    }
+                  }
+                },
+                "http_user_agent": {
+                  "type": "text",
+                  "fields": {
+                    "keyword": {
+                      "type": "keyword",
+                      "ignore_above": 512
+                    }
+                  }
+                },
+                "http_method": {
+                  "type": "keyword"
+                },
+                "status": {
+                  "type": "integer"
+                },
+                "length": {
+                  "type": "long"
+                }
+              }
+            },
+            "flow": {
+              "properties": {
+                "pkts_toserver": {
+                  "type": "long"
+                },
+                "pkts_toclient": {
+                  "type": "long"
+                },
+                "bytes_toserver": {
+                  "type": "long"
+                },
+                "bytes_toclient": {
+                  "type": "long"
+                },
+                "start": {
+                  "type": "date"
+                }
+              }
+            }
+          }
+        },
+
+        "source_ip": {
+          "type": "alias",
+          "path": "suricata.src_ip"
+        },
+
+        "destination_ip": {
+          "type": "alias",
+          "path": "suricata.dest_ip"
+        },
+
+        "source_network": {
+          "properties": {
+            "ip": {
+              "type": "ip"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "geo": {
+              "properties": {
+                "city_name": { "type": "keyword" },
+                "country_name": { "type": "keyword" },
+                "country_code2": { "type": "keyword" },
+                "continent_name": { "type": "keyword" },
+                "region_name": { "type": "keyword" },
+                "location": { "type": "geo_point" },
+                "timezone": { "type": "keyword" }
+              }
+            },
+            "as": {
+              "properties": {
+                "number": { "type": "long" },
+                "organization": {
+                  "properties": {
+                    "name": { "type": "keyword" }
+                  }
+                }
+              }
+            }
+          }
+        },
+
+        "destination_network": {
+          "properties": {
+            "ip": {
+              "type": "ip"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "geo": {
+              "properties": {
+                "city_name": { "type": "keyword" },
+                "country_name": { "type": "keyword" },
+                "country_code2": { "type": "keyword" },
+                "continent_name": { "type": "keyword" },
+                "region_name": { "type": "keyword" },
+                "location": { "type": "geo_point" },
+                "timezone": { "type": "keyword" }
+              }
+            },
+            "as": {
+              "properties": {
+                "number": { "type": "long" },
+                "organization": {
+                  "properties": {
+                    "name": { "type": "keyword" }
+                  }
+                }
+              }
+            }
+          }
+        },
+
+        "container": {
+          "properties": {
+            "id": { "type": "keyword" },
+            "name": { "type": "keyword" },
+            "image": {
+              "properties": {
+                "name": { "type": "keyword" },
+                "tag": { "type": "keyword" }
+              }
+            }
+          }
+        },
+
+        "kubernetes": {
+          "properties": {
+            "pod": {
+              "properties": {
+                "name": { "type": "keyword" },
+                "uid": { "type": "keyword" },
+                "ip": { "type": "ip" }
+              }
+            },
+            "namespace": { "type": "keyword" },
+            "deployment": {
+              "properties": {
+                "name": { "type": "keyword" }
+              }
+            },
+            "node": {
+              "properties": {
+                "name": { "type": "keyword" }
+              }
+            },
+            "labels": {
+              "type": "object",
+              "dynamic": true
+            },
+            "annotations": {
+              "type": "object",
+              "dynamic": true
+            }
+          }
+        },
+
+        "process": {
+          "properties": {
+            "name": { "type": "keyword" },
+            "pid": { "type": "long" },
+            "command_line": {
+              "type": "text",
+              "analyzer": "command_line_analyzer",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 2048
+                }
+              }
+            },
+            "parent": {
+              "properties": {
+                "name": { "type": "keyword" },
+                "pid": { "type": "long" }
+              }
+            }
+          }
+        },
+
+        "user": {
+          "properties": {
+            "name": { "type": "keyword" },
+            "uid": { "type": "keyword" }
+          }
+        },
+
+        "file": {
+          "properties": {
+            "path": {
+              "type": "keyword"
+            },
+            "name": {
+              "type": "keyword"
+            }
+          }
+        },
+
+        "tls": {
+          "properties": {
+            "client": {
+              "properties": {
+                "ja3": { "type": "keyword" }
+              }
+            },
+            "server": {
+              "properties": {
+                "ja3s": { "type": "keyword" }
+              }
+            }
+          }
+        },
+
+        "k8s_audit": {
+          "type": "object",
+          "dynamic": true
+        },
+
+        "host": {
+          "properties": {
+            "name": { "type": "keyword" },
+            "hostname": { "type": "keyword" },
+            "ip": { "type": "ip" },
+            "os": {
+              "properties": {
+                "family": { "type": "keyword" },
+                "name": { "type": "keyword" },
+                "version": { "type": "keyword" }
+              }
+            }
+          }
+        },
+
+        "cloud": {
+          "properties": {
+            "provider": { "type": "keyword" },
+            "project": {
+              "properties": {
+                "id": { "type": "keyword" }
+              }
+            },
+            "region": { "type": "keyword" },
+            "availability_zone": { "type": "keyword" },
+            "instance": {
+              "properties": {
+                "id": { "type": "keyword" },
+                "name": { "type": "keyword" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "composed_of": [],
+  "priority": 500,
+  "version": 1,
+  "_meta": {
+    "description": "Security events index template for APT detection in GKE/GCP",
+    "managed_by": "devsecops-project",
+    "last_updated": "2026-02-18"
+  }
+}

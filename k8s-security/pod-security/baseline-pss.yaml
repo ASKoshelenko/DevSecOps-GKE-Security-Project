@@ -1,0 +1,211 @@
+# =============================================================================
+# Baseline Pod Security Standard (PSS) - Minimum Security
+# =============================================================================
+#
+# PURPOSE: Enforces the 'baseline' Pod Security Standard on a namespace.
+# This profile prevents the most obvious and dangerous security violations
+# while being less restrictive than 'restricted'.
+#
+# THE BASELINE PROFILE PREVENTS:
+#   - Privileged containers
+#   - Host namespace sharing (hostPID, hostNetwork, hostIPC)
+#   - hostPath volumes
+#   - Dangerous capabilities (SYS_ADMIN, NET_RAW, etc.)
+#   - Host ports (some exceptions possible)
+#   - AppArmor disabled explicitly
+#   - Seccomp set to Unconfined
+#   - Certain proc mount types
+#   - Windows-specific runAsUserName
+#
+# THE BASELINE PROFILE ALLOWS (unlike restricted):
+#   - Running as root (UID 0)
+#   - Privilege escalation (allowPrivilegeEscalation: true)
+#   - Read-write root filesystem
+#   - Additional capabilities beyond NET_BIND_SERVICE
+#   - No seccomp profile required
+#
+# USE CASES:
+#   - Staging/development environments
+#   - Applications that must run as root but not privileged
+#   - Migration path from no PSS to restricted
+#
+# APPLY:
+#   kubectl apply -f baseline-pss.yaml
+#
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Baseline Namespace - Staging workloads
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+  labels:
+    # ENFORCE: Reject pods that violate the baseline policy
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+
+    # WARN at restricted level to show what would fail in production
+    # This helps teams prepare for migration to restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+
+    # AUDIT at restricted level for logging
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+
+    environment: staging
+    security-profile: baseline
+
+---
+# ---------------------------------------------------------------------------
+# Baseline Namespace - Development workloads
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: development
+  labels:
+    # ENFORCE baseline
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+
+    # WARN at baseline (less noisy for development)
+    pod-security.kubernetes.io/warn: baseline
+    pod-security.kubernetes.io/warn-version: latest
+
+    # AUDIT at restricted to track what would need fixing
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+
+    environment: development
+    security-profile: baseline
+
+---
+# ---------------------------------------------------------------------------
+# Example: Pod that PASSES the baseline policy
+# (Would FAIL restricted because it runs as root)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Pod
+metadata:
+  name: baseline-compliant-pod
+  namespace: staging
+  labels:
+    app: legacy-app
+spec:
+  # No host namespaces (required by baseline)
+  containers:
+    - name: legacy-app
+      image: nginx:1.25
+
+      securityContext:
+        # ALLOWED in baseline: Running as root
+        runAsUser: 0
+
+        # ALLOWED in baseline: Privilege escalation
+        allowPrivilegeEscalation: true
+
+        # ALLOWED in baseline: Read-write root filesystem
+        readOnlyRootFilesystem: false
+
+        # NOT ALLOWED even in baseline: privileged
+        privileged: false
+
+        capabilities:
+          drop:
+            - ALL
+          add:
+            # ALLOWED in baseline: These capabilities
+            - NET_BIND_SERVICE
+            - CHOWN
+            - SETGID
+            - SETUID
+            - DAC_OVERRIDE
+            # NOT ALLOWED in baseline:
+            # - SYS_ADMIN
+            # - SYS_PTRACE
+            # - NET_RAW (in K8s 1.25+)
+
+      ports:
+        - containerPort: 80
+          protocol: TCP
+
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "50m"
+        limits:
+          memory: "256Mi"
+          cpu: "500m"
+
+      volumeMounts:
+        - name: data
+          mountPath: /data
+
+  volumes:
+    # ALLOWED: emptyDir, configMap, secret, projected, downwardAPI
+    - name: data
+      emptyDir: {}
+    # NOT ALLOWED in baseline: hostPath
+    # - name: host
+    #   hostPath:
+    #     path: /
+
+---
+# ---------------------------------------------------------------------------
+# PSS Migration Strategy: Privileged -> Baseline -> Restricted
+# ---------------------------------------------------------------------------
+#
+# Step 1: Apply baseline in WARN mode only (no enforcement)
+#
+# apiVersion: v1
+# kind: Namespace
+# metadata:
+#   name: my-namespace
+#   labels:
+#     pod-security.kubernetes.io/warn: baseline
+#     pod-security.kubernetes.io/audit: baseline
+#
+# Step 2: Fix violations, then enforce baseline + warn restricted
+#
+# apiVersion: v1
+# kind: Namespace
+# metadata:
+#   name: my-namespace
+#   labels:
+#     pod-security.kubernetes.io/enforce: baseline
+#     pod-security.kubernetes.io/warn: restricted
+#     pod-security.kubernetes.io/audit: restricted
+#
+# Step 3: Fix remaining violations, then enforce restricted
+#
+# apiVersion: v1
+# kind: Namespace
+# metadata:
+#   name: my-namespace
+#   labels:
+#     pod-security.kubernetes.io/enforce: restricted
+#     pod-security.kubernetes.io/warn: restricted
+#     pod-security.kubernetes.io/audit: restricted
+
+---
+# ---------------------------------------------------------------------------
+# Comparison Matrix: Baseline vs Restricted
+# ---------------------------------------------------------------------------
+#
+# | Feature                    | Baseline | Restricted |
+# |---------------------------|----------|------------|
+# | Privileged containers      | DENY     | DENY       |
+# | Host namespaces            | DENY     | DENY       |
+# | hostPath volumes           | DENY     | DENY       |
+# | Host ports                 | DENY     | DENY       |
+# | SYS_ADMIN capability       | DENY     | DENY       |
+# | Running as root            | ALLOW    | DENY       |
+# | Privilege escalation       | ALLOW    | DENY       |
+# | Non-default capabilities   | ALLOW    | DENY       |
+# | Writable root FS           | ALLOW    | Recommended|
+# | Seccomp required           | No       | YES        |
+# | Non-default seccomp        | DENY     | DENY       |
+# | AppArmor unconfined        | DENY     | DENY       |

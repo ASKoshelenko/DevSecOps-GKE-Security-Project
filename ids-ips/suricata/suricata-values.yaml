@@ -1,0 +1,396 @@
+# =============================================================================
+# Suricata Helm Values - GKE Network IDS Deployment
+# =============================================================================
+#
+# Deploys Suricata as a DaemonSet on GKE for network-level threat detection.
+# Suricata is chosen over Snort for its multi-threaded architecture, better
+# performance with modern hardware, and native eve.json output format
+# which integrates well with ELK stack.
+#
+# Capture mode: AF_PACKET (raw socket capture on each node's network interface)
+# Output: eve.json for Filebeat/ELK consumption
+#
+# Installation:
+#   helm install suricata ./suricata-chart \
+#     --namespace suricata-system --create-namespace \
+#     -f suricata-values.yaml
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Image Configuration
+# -----------------------------------------------------------------------------
+image:
+  repository: jasonish/suricata
+  tag: "7.0.3"
+  pullPolicy: IfNotPresent
+
+# -----------------------------------------------------------------------------
+# Deployment Configuration
+# -----------------------------------------------------------------------------
+# DaemonSet ensures every GKE node runs a Suricata instance for complete
+# network coverage. Each instance monitors the node's primary interface.
+# -----------------------------------------------------------------------------
+kind: DaemonSet
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+
+# Run on all nodes including system nodes
+tolerations:
+  - effect: NoSchedule
+    operator: Exists
+  - effect: NoExecute
+    operator: Exists
+
+nodeSelector: {}
+
+# High priority to prevent eviction
+priorityClassName: system-node-critical
+
+# -----------------------------------------------------------------------------
+# Suricata Configuration
+# -----------------------------------------------------------------------------
+suricata:
+  # Network interface to monitor on each GKE node.
+  # GKE COS nodes typically use eth0 as the primary interface.
+  interface: "eth0"
+
+  # AF_PACKET capture mode - high performance, zero-copy packet capture.
+  # This mode uses memory-mapped ring buffers for minimal CPU overhead.
+  captureMode: "af-packet"
+
+  # AF_PACKET specific settings
+  afPacket:
+    # Number of threads per interface (match to node CPU count)
+    threads: auto
+    # Cluster type for load balancing across threads
+    clusterType: cluster_flow
+    # Ring buffer size (in packets)
+    ringSize: 2048
+    # Block size for memory-mapped ring buffer
+    blockSize: 32768
+    # Use TPACKET_V3 for better performance
+    tpacketV3: true
+
+  # Detection engine configuration
+  detection:
+    # Profile: high for maximum detection accuracy
+    profile: high
+    # Inspection depth limits
+    httpBodyLimit: 131072
+    streamDepth: 1048576
+
+  # Threading model - workers mode for best performance
+  # Each worker thread handles capture + detection for its flow set
+  runMode: workers
+
+  # Home network definition for GKE
+  # These CIDRs should match your VPC and pod/service ranges
+  vars:
+    addressGroups:
+      HOME_NET: "[10.0.0.0/8,172.16.0.0/12,192.168.0.0/16]"
+      EXTERNAL_NET: "!$HOME_NET"
+      HTTP_SERVERS: "$HOME_NET"
+      DNS_SERVERS: "$HOME_NET"
+      SMTP_SERVERS: "$HOME_NET"
+    portGroups:
+      HTTP_PORTS: "[80,8080,8000,8443,443]"
+      SHELLCODE_PORTS: "!80"
+      ORACLE_PORTS: "1521"
+      SSH_PORTS: "22"
+
+  # Protocol detection settings
+  appLayer:
+    protocols:
+      http:
+        enabled: yes
+        # Decode and inspect HTTP request/response bodies
+        requestBody: yes
+        responseBody: yes
+        requestBodyLimit: 131072
+        responseBodyLimit: 131072
+      tls:
+        enabled: yes
+        # JA3/JA3S fingerprinting for C2 detection
+        ja3Fingerprints: yes
+      dns:
+        enabled: yes
+        # Log all DNS queries for threat hunting
+        requestFlood: 500
+      ssh:
+        enabled: yes
+        hassh: yes
+      ftp:
+        enabled: yes
+      smtp:
+        enabled: yes
+      ikev2:
+        enabled: yes
+      krb5:
+        enabled: yes
+      dhcp:
+        enabled: yes
+
+# -----------------------------------------------------------------------------
+# Rule Configuration
+# -----------------------------------------------------------------------------
+# Load both Emerging Threats rules and our custom APT detection rules.
+# Custom rules are mounted from a ConfigMap.
+# -----------------------------------------------------------------------------
+rules:
+  # Emerging Threats Open ruleset - community-maintained threat intelligence
+  emergingThreats:
+    enabled: true
+    # Update rules daily via cron job
+    updateInterval: "0 2 * * *"
+
+  # Custom rules file mounted from ConfigMap
+  customRulesEnabled: true
+  customRulesPath: /etc/suricata/rules/custom.rules
+
+  # Rule categories to enable from ET ruleset
+  enabledCategories:
+    - emerging-malware
+    - emerging-trojan
+    - emerging-exploit
+    - emerging-dos
+    - emerging-scan
+    - emerging-shellcode
+    - emerging-policy
+    - emerging-mining
+    - emerging-dns
+    - emerging-info
+
+  # Suppress rules that generate too many false positives in GKE
+  suppressList:
+    # GKE internal health checks trigger HTTP anomaly rules
+    - gid: 1
+      sid: 2013504
+      track: by_src
+      ip: "10.0.0.0/8"
+
+# -----------------------------------------------------------------------------
+# Output Configuration
+# -----------------------------------------------------------------------------
+# eve.json is Suricata's unified JSON log format, designed for consumption
+# by ELK stack, Splunk, and other SIEM platforms.
+# -----------------------------------------------------------------------------
+outputs:
+  eve:
+    enabled: true
+    filetype: regular
+    filename: /var/log/suricata/eve.json
+    # Rotate logs at 100MB to prevent disk exhaustion
+    rotateInterval: 600
+    rotateSize: "100mb"
+
+    # Event types to log
+    types:
+      - alert:
+          # Include full packet data for forensic analysis
+          payload: yes
+          payloadPrintable: yes
+          packet: yes
+          # Include HTTP request/response for context
+          httpBody: yes
+          httpBodyPrintable: yes
+          # Include metadata
+          metadata: yes
+          # Include flow information
+          tagged-packets: yes
+      - anomaly:
+          enabled: yes
+          types:
+            decode: yes
+            stream: yes
+            applayer: yes
+      - http:
+          enabled: yes
+          extended: yes
+      - dns:
+          enabled: yes
+      - tls:
+          enabled: yes
+          extended: yes
+          # Log JA3 fingerprints for threat hunting
+          ja3: yes
+          ja3s: yes
+      - files:
+          enabled: yes
+          forceFilestore: no
+      - ssh:
+          enabled: yes
+          hassh: yes
+      - flow:
+          enabled: yes
+      - netflow:
+          enabled: yes
+      - stats:
+          enabled: yes
+          interval: 30
+
+  # Fast log for quick human-readable alerts
+  fast:
+    enabled: true
+    filename: /var/log/suricata/fast.log
+
+  # Stats log for monitoring Suricata health
+  stats:
+    enabled: true
+    filename: /var/log/suricata/stats.log
+    interval: 30
+
+# -----------------------------------------------------------------------------
+# ConfigMap for Custom Rules
+# -----------------------------------------------------------------------------
+# The custom.rules file is loaded from a ConfigMap created separately.
+# This allows rule updates without redeploying Suricata.
+# -----------------------------------------------------------------------------
+customRulesConfigMap:
+  name: suricata-custom-rules
+  mountPath: /etc/suricata/rules/custom.rules
+  subPath: custom.rules
+
+# -----------------------------------------------------------------------------
+# Volume Configuration
+# -----------------------------------------------------------------------------
+# Persistent volumes for log storage and rule management.
+# -----------------------------------------------------------------------------
+volumes:
+  # Log directory - shared with Filebeat sidecar for log collection
+  logs:
+    hostPath:
+      path: /var/log/suricata
+      type: DirectoryOrCreate
+    mountPath: /var/log/suricata
+
+  # Rule directory
+  rules:
+    emptyDir: {}
+    mountPath: /etc/suricata/rules
+
+  # Suricata run directory (PID file, unix socket)
+  run:
+    emptyDir: {}
+    mountPath: /var/run/suricata
+
+# -----------------------------------------------------------------------------
+# Resource Limits
+# -----------------------------------------------------------------------------
+# Suricata is CPU and memory intensive. These limits are tuned for GKE
+# e2-standard-4 nodes (4 vCPU, 16GB RAM).
+# Adjust based on traffic volume and node size.
+# -----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+
+# -----------------------------------------------------------------------------
+# Security Context
+# -----------------------------------------------------------------------------
+# Suricata needs NET_RAW and NET_ADMIN capabilities for packet capture.
+# It also needs access to the host network namespace.
+# -----------------------------------------------------------------------------
+hostNetwork: true
+dnsPolicy: ClusterFirstWithHostNet
+
+securityContext:
+  capabilities:
+    add:
+      - NET_RAW
+      - NET_ADMIN
+      - SYS_NICE  # For thread priority management
+  readOnlyRootFilesystem: false
+
+podSecurityContext:
+  runAsNonRoot: false
+
+# -----------------------------------------------------------------------------
+# Service Account
+# -----------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: suricata
+  annotations:
+    iam.gke.io/gcp-service-account: "suricata-ids@PROJECT_ID.iam.gserviceaccount.com"
+
+# -----------------------------------------------------------------------------
+# Filebeat Sidecar
+# -----------------------------------------------------------------------------
+# A Filebeat sidecar reads eve.json and ships it to Elasticsearch.
+# This is more reliable than relying on a separate Filebeat DaemonSet
+# because it guarantees the log volume is always accessible.
+# -----------------------------------------------------------------------------
+sidecar:
+  filebeat:
+    enabled: true
+    image:
+      repository: docker.elastic.co/beats/filebeat
+      tag: "8.12.0"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+    config:
+      output.elasticsearch:
+        hosts: ["http://elasticsearch-master:9200"]
+        index: "suricata-%{+yyyy.MM.dd}"
+      filebeat.inputs:
+        - type: log
+          enabled: true
+          paths:
+            - /var/log/suricata/eve.json
+          json.keys_under_root: true
+          json.add_error_key: true
+          json.overwrite_keys: true
+          fields:
+            source: suricata
+            environment: production
+          fields_under_root: true
+
+# -----------------------------------------------------------------------------
+# Pod Labels and Annotations
+# -----------------------------------------------------------------------------
+podLabels:
+  app.kubernetes.io/part-of: ids-ips
+  security.devsecops/component: network-ids
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9090"
+  prometheus.io/path: "/metrics"
+
+# -----------------------------------------------------------------------------
+# Health Checks
+# -----------------------------------------------------------------------------
+livenessProbe:
+  exec:
+    command:
+      - suricatasc
+      - -c
+      - "uptime"
+      - /var/run/suricata/suricata-command.socket
+  initialDelaySeconds: 60
+  periodSeconds: 30
+  timeoutSeconds: 10
+
+readinessProbe:
+  exec:
+    command:
+      - suricatasc
+      - -c
+      - "uptime"
+      - /var/run/suricata/suricata-command.socket
+  initialDelaySeconds: 30
+  periodSeconds: 15
+  timeoutSeconds: 10

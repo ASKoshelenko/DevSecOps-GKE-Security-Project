@@ -1,0 +1,193 @@
+# =============================================================================
+# Kind Cluster Configuration - INTENTIONALLY VULNERABLE (Educational Only)
+# =============================================================================
+#
+# PURPOSE: This configuration creates a deliberately insecure Kubernetes cluster
+# for demonstrating common attack vectors and security misconfigurations.
+#
+# WARNING: NEVER use these settings in production. This cluster is designed
+# to be exploitable for authorized security testing and education.
+#
+# VULNERABLE K8s VERSION: 1.23.17
+# Known CVEs in this version include:
+#   - CVE-2022-3172: Aggregated API server DoS
+#   - CVE-2022-3162: Unauthorized read of custom resources
+#   - CVE-2022-3294: Node address validation bypass
+#   - CVE-2023-2728: ServiceAccount token secret bypass
+#
+# =============================================================================
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+
+# Use a vulnerable Kubernetes version (1.23.x)
+# This version has known CVEs and lacks modern security defaults
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.23.17@sha256:fbb92ac580fce498473762419df27fa8664571e0c3e2564cf455b545c7e92e5b
+
+    # -------------------------------------------------------------------------
+    # VULNERABLE: Mount host paths into the control plane node
+    # This allows containers to access host filesystems if they can mount them
+    # -------------------------------------------------------------------------
+    extraMounts:
+      - hostPath: /var/run/docker.sock
+        containerPath: /var/run/docker.sock
+        readOnly: false
+        # VULNERABLE: Mounting Docker socket allows full container breakout
+        # An attacker who gains access to this socket can spawn privileged
+        # containers on the host, effectively owning the host machine.
+
+      - hostPath: /
+        containerPath: /host
+        readOnly: false
+        # VULNERABLE: Mounting the entire host root filesystem
+        # Allows any container with access to read/write ALL host files,
+        # including /etc/shadow, SSH keys, kubelet credentials, etc.
+
+      - hostPath: /proc
+        containerPath: /host-proc
+        readOnly: false
+        # VULNERABLE: Mounting /proc allows process namespace manipulation
+        # An attacker can use /proc/1/root to traverse into the host's
+        # filesystem or use /proc/sysrq-trigger for kernel-level attacks.
+
+    # -------------------------------------------------------------------------
+    # VULNERABLE: Disable critical security features on the API server
+    # -------------------------------------------------------------------------
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            # VULNERABLE: Disable audit logging
+            # Without audit logs, attacker activity goes undetected
+            audit-log-path: ""
+
+            # VULNERABLE: Allow anonymous authentication
+            # Unauthenticated users can access the API server
+            anonymous-auth: "true"
+
+            # VULNERABLE: Disable admission controllers that enforce security
+            # PodSecurityPolicy (PSP) is disabled, allowing privileged pods
+            # ServiceAccount admission is weakened
+            enable-admission-plugins: "NamespaceLifecycle,LimitRanger,ServiceAccount,DefaultStorageClass,DefaultTolerationSeconds,MutatingAdmissionWebhook,ValidatingAdmissionWebhook,ResourceQuota"
+            disable-admission-plugins: "PodSecurityPolicy"
+
+            # VULNERABLE: Allow privileged containers cluster-wide
+            allow-privileged: "true"
+
+            # VULNERABLE: Insecure port enabled (deprecated but still works)
+            # Allows unauthenticated access to the API server
+            insecure-port: "8080"
+            insecure-bind-address: "0.0.0.0"
+
+            # VULNERABLE: Weak authorization mode
+            # AlwaysAllow grants every request without RBAC checks
+            authorization-mode: "AlwaysAllow"
+
+            # VULNERABLE: Disable TLS verification for webhooks
+            # Man-in-the-middle attacks on admission webhooks become possible
+            # admission-control-config-file is left unset
+
+          extraVolumes:
+            - name: host-root
+              hostPath: /host
+              mountPath: /host-root
+              readOnly: false
+              pathType: DirectoryOrCreate
+
+        controllerManager:
+          extraArgs:
+            # VULNERABLE: Bind to all interfaces
+            bind-address: "0.0.0.0"
+
+        scheduler:
+          extraArgs:
+            # VULNERABLE: Bind to all interfaces
+            bind-address: "0.0.0.0"
+
+        etcd:
+          local:
+            extraArgs:
+              # VULNERABLE: Listen on all interfaces without TLS
+              listen-client-urls: "http://0.0.0.0:2379"
+              # VULNERABLE: No authentication for etcd
+              # Anyone who can reach port 2379 can read/write cluster state
+
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            # VULNERABLE: Allow all pod security contexts
+            # No restrictions on privileged, hostPID, hostNetwork, etc.
+            # (feature-gates for PodSecurity enforcement are off)
+            feature-gates: "PodSecurity=false"
+
+            # VULNERABLE: Enable read-only port without auth
+            # Exposes pod/node info on port 10255 without authentication
+            read-only-port: "10255"
+
+            # VULNERABLE: Disable protect-kernel-defaults
+            # Allows containers to modify kernel parameters
+            protect-kernel-defaults: "false"
+
+    # -------------------------------------------------------------------------
+    # VULNERABLE: Expose insecure ports to the host
+    # -------------------------------------------------------------------------
+    extraPortMappings:
+      - containerPort: 8080
+        hostPort: 8080
+        protocol: TCP
+        # Insecure API server port (no auth)
+
+      - containerPort: 10255
+        hostPort: 10255
+        protocol: TCP
+        # Kubelet read-only port (no auth)
+
+      - containerPort: 2379
+        hostPort: 2379
+        protocol: TCP
+        # etcd client port (no auth, no TLS)
+
+      - containerPort: 30000
+        hostPort: 30000
+        protocol: TCP
+        # NodePort range start
+
+      - containerPort: 30001
+        hostPort: 30001
+        protocol: TCP
+
+  # ---------------------------------------------------------------------------
+  # Worker node - also vulnerable
+  # ---------------------------------------------------------------------------
+  - role: worker
+    image: kindest/node:v1.23.17@sha256:fbb92ac580fce498473762419df27fa8664571e0c3e2564cf455b545c7e92e5b
+    extraMounts:
+      - hostPath: /var/run/docker.sock
+        containerPath: /var/run/docker.sock
+        readOnly: false
+      - hostPath: /
+        containerPath: /host
+        readOnly: false
+
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            read-only-port: "10255"
+            protect-kernel-defaults: "false"
+            feature-gates: "PodSecurity=false"
+
+# =============================================================================
+# Networking - intentionally flat/open
+# =============================================================================
+networking:
+  # VULNERABLE: Disable default network policy enforcement
+  # All pods can communicate with all other pods without restriction
+  disableDefaultCNI: false
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
